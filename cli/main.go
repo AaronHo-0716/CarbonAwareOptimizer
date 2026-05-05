@@ -197,8 +197,135 @@ func getVCPUs(instanceType string, vcpuMap map[string]int) int {
 	return 2
 }
 
+func calculateImpact(plan *TFPlan, region string, gridIntensity float64, embodiedData map[string]float64, vcpuMap map[string]int, x86Coeff, armCoeff UseCoeff) ([]ResourceImpact, float64, float64) {
+	var totalDailyOps float64
+	var totalDailyEmb float64
+	var impacts []ResourceImpact
+
+	const PUE = 1.135
+	const LifespanDays = 1460.0
+
+	for _, res := range plan.PlannedValues.RootModule.Resources {
+		if res.Mode != "managed" {
+			continue
+		}
+
+		if res.Type == "aws_instance" || res.Type == "aws_autoscaling_group" || res.Type == "aws_db_instance" {
+			var iType string
+			count := 1.0
+
+			if res.Type == "aws_instance" {
+				if val, ok := res.Values["instance_type"].(string); ok {
+					iType = val
+				}
+			} else if res.Type == "aws_autoscaling_group" {
+				if val, ok := res.Values["desired_capacity"].(float64); ok {
+					count = val
+				}
+				iType = "t3.medium"
+			} else if res.Type == "aws_db_instance" {
+				if val, ok := res.Values["instance_class"].(string); ok {
+					iType = strings.TrimPrefix(val, "db.")
+				}
+			}
+
+			if iType == "" {
+				iType = "m5.large"
+			}
+
+			vcpus := float64(getVCPUs(iType, vcpuMap))
+
+			coeff := x86Coeff
+			if strings.Contains(iType, "g.") || strings.Contains(iType, "g2.") || strings.Contains(iType, "g3.") || strings.Contains(iType, "g4.") || strings.Contains(iType, "r7g") {
+				coeff = armCoeff
+			}
+
+			avgWattsPerVcpu := coeff.MinWatts + (coeff.MaxWatts-coeff.MinWatts)*0.5
+			dailyKwhPerInstance := (avgWattsPerVcpu * vcpus * 24.0 * PUE) / 1000.0
+
+			dailyOpsPerInstance := (dailyKwhPerInstance * gridIntensity) / 1000.0
+			dailyOps := dailyOpsPerInstance * count
+
+			embodiedTotal := embodiedData[iType]
+			if embodiedTotal == 0 {
+				embodiedTotal = 1200.0
+			}
+			dailyEmbPerInstance := embodiedTotal / LifespanDays
+			dailyEmb := dailyEmbPerInstance * count
+
+			impacts = append(impacts, ResourceImpact{
+				Type:       res.Type,
+				Name:       res.Name,
+				Instance:   iType,
+				Count:      int(count),
+				DailyOps:   dailyOps,
+				DailyEmb:   dailyEmb,
+				TotalDaily: dailyOps + dailyEmb,
+			})
+
+			totalDailyOps += dailyOps
+			totalDailyEmb += dailyEmb
+		}
+	}
+	return impacts, totalDailyOps, totalDailyEmb
+}
+
+type AIRequest struct {
+	Model    string `json:"model"`
+	Messages []struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	} `json:"messages"`
+}
+
+type AIResponse struct {
+	Choices []struct {
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
+	} `json:"choices"`
+}
+
+func getAISuggestions(apiKey string, topResource ResourceImpact, region string, gridIntensity float64) string {
+	prompt := fmt.Sprintf("You are a GreenOps Specialist. This %s in %s (Grid Intensity: %.2f gCO2e/kWh) produces %.3f kg of CO2 daily. Suggest: 1. A Graviton equivalent, 2. A greener region with lower grid intensity (e.g., if in Asia, suggest a green Asian region like ap-northeast-3 or similar, or global alternatives), and 3. Scheduling or Rightsizing logic.", topResource.Instance, region, gridIntensity, topResource.TotalDaily)
+
+	fmt.Println("\n🤖 Fetching AI Insights...")
+
+	if apiKey == "" || apiKey == "skip" {
+		return fmt.Sprintf("Mock AI Response for %s:\n1. Graviton Equivalent: Consider migrating to the 'g' variant (e.g. if m5, use m6g).\n2. Greener Region: Move to eu-west-1 (Ireland) or ca-central-1 (Canada).\n3. Scheduling: Turn off outside of business hours (saves ~65%%).", topResource.Instance)
+	}
+
+	reqBody := AIRequest{
+		Model: "gpt-4o-mini",
+	}
+	reqBody.Messages = append(reqBody.Messages, struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}{Role: "user", Content: prompt})
+
+	jsonBody, _ := json.Marshal(reqBody)
+	req, _ := http.NewRequest("POST", "https://api.openai.com/v1/chat/completions", strings.NewReader(string(jsonBody)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil || resp.StatusCode != 200 {
+		return "⚠️ Failed to fetch AI suggestions. Please check your API Key."
+	}
+	defer resp.Body.Close()
+
+	var aiResp AIResponse
+	if err := json.NewDecoder(resp.Body).Decode(&aiResp); err != nil || len(aiResp.Choices) == 0 {
+		return "⚠️ Could not parse AI response."
+	}
+
+	return aiResp.Choices[0].Message.Content
+}
+
 func main() {
 	var emToken string
+	var openAIToken string
 	var tfPlanFile string
 
 	if envContent, err := os.ReadFile(".env"); err == nil {
@@ -206,8 +333,28 @@ func main() {
 		for _, line := range strings.Split(content, "\n") {
 			if strings.HasPrefix(line, "ELECTRICITYMAPS_TOKEN=") {
 				emToken = strings.TrimPrefix(line, "ELECTRICITYMAPS_TOKEN=")
-				break
 			}
+			if strings.HasPrefix(line, "OPENAI_API_KEY=") {
+				openAIToken = strings.TrimPrefix(line, "OPENAI_API_KEY=")
+			}
+		}
+	}
+
+	if openAIToken == "" {
+		huh.NewForm(
+			huh.NewGroup(
+				huh.NewInput().Title("OpenAI API Key (optional, press enter to skip)").Value(&openAIToken),
+			),
+		).Run()
+		if openAIToken != "" && openAIToken != "skip" {
+			// Append to .env safely
+			f, err := os.OpenFile(".env", os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
+			if err == nil {
+				f.WriteString(fmt.Sprintf("OPENAI_API_KEY=%s\n", openAIToken))
+				f.Close()
+			}
+		} else {
+			openAIToken = "skip"
 		}
 	}
 
@@ -286,81 +433,17 @@ func main() {
 		gridIntensity := getGridIntensity(emToken, region)
 		fmt.Printf("📍 Region identified: %s (Intensity: %.2f gCO2e/kWh)\n\n", region, gridIntensity)
 
-		var totalDailyOps float64
-		var totalDailyEmb float64
-		var totalInstances int
-		var impacts []ResourceImpact
+		impacts, totalDailyOps, totalDailyEmb := calculateImpact(&plan, region, gridIntensity, embodiedData, vcpuMap, x86Coeff, armCoeff)
 
-		// Constants for CCF Physics Formula
-		const PUE = 1.135           // Typical AWS PUE
-		const LifespanDays = 1460.0 // 4 years
+		totalInstances := 0
+		var topResource ResourceImpact
+		highestDaily := -1.0
 
-		for _, res := range plan.PlannedValues.RootModule.Resources {
-			if res.Mode != "managed" {
-				continue
-			}
-
-			if res.Type == "aws_instance" || res.Type == "aws_autoscaling_group" || res.Type == "aws_db_instance" {
-				var iType string
-				count := 1.0
-
-				if res.Type == "aws_instance" {
-					if val, ok := res.Values["instance_type"].(string); ok {
-						iType = val
-					}
-				} else if res.Type == "aws_autoscaling_group" {
-					if val, ok := res.Values["desired_capacity"].(float64); ok {
-						count = val
-					}
-					iType = "t3.medium" // Fallback mock for ASG if exact type isn't readily in plan
-				} else if res.Type == "aws_db_instance" {
-					if val, ok := res.Values["instance_class"].(string); ok {
-						iType = strings.TrimPrefix(val, "db.")
-					}
-				}
-
-				if iType == "" {
-					iType = "m5.large" // Default fallback
-				}
-
-				totalInstances += int(count)
-				vcpus := float64(getVCPUs(iType, vcpuMap))
-
-				// Determine architecture
-				coeff := x86Coeff
-				if strings.Contains(iType, "g.") || strings.Contains(iType, "g2.") || strings.Contains(iType, "g3.") || strings.Contains(iType, "g4.") {
-					coeff = armCoeff // Graviton
-				}
-
-				// 1. Operational Emissions (CCF Formula)
-				// E_daily = (P_min + (P_max - P_min) * 0.5) * 24 * PUE
-				// Note: Coeffs are per vCPU in Watts. We multiply by vCPUs, then divide by 1000 for kWh
-				avgWattsPerVcpu := coeff.MinWatts + (coeff.MaxWatts-coeff.MinWatts)*0.5
-				dailyKwhPerInstance := (avgWattsPerVcpu * vcpus * 24.0 * PUE) / 1000.0
-
-				dailyOpsPerInstance := (dailyKwhPerInstance * gridIntensity) / 1000.0 // kgCO2e
-				dailyOps := dailyOpsPerInstance * count
-
-				// 2. Embodied Emissions
-				embodiedTotal := embodiedData[iType] // kgCO2e
-				if embodiedTotal == 0 {
-					embodiedTotal = 1200.0 // 1.2 metric tons fallback
-				}
-				dailyEmbPerInstance := embodiedTotal / LifespanDays
-				dailyEmb := dailyEmbPerInstance * count
-
-				impacts = append(impacts, ResourceImpact{
-					Type:       res.Type,
-					Name:       res.Name,
-					Instance:   iType,
-					Count:      int(count),
-					DailyOps:   dailyOps,
-					DailyEmb:   dailyEmb,
-					TotalDaily: dailyOps + dailyEmb,
-				})
-
-				totalDailyOps += dailyOps
-				totalDailyEmb += dailyEmb
+		for _, imp := range impacts {
+			totalInstances += imp.Count
+			if imp.TotalDaily > highestDaily {
+				highestDaily = imp.TotalDaily
+				topResource = imp
 			}
 		}
 
@@ -383,17 +466,87 @@ func main() {
 		}
 
 		fmt.Println(strings.Repeat("-", 103))
+		originalTotal := totalDailyOps + totalDailyEmb
 		fmt.Printf("%-64s %-6d %-10.3f %-10.3f %-10.3f\n",
-			"TOTALS", totalInstances, totalDailyOps, totalDailyEmb, totalDailyOps+totalDailyEmb)
+			"TOTALS", totalInstances, totalDailyOps, totalDailyEmb, originalTotal)
 
-		// AI / Optimization Heuristics
-		if gridIntensity > 200 {
-			fmt.Println("\n💡 Optimization Suggestion: High Grid Intensity Detected!")
-			fmt.Printf("   Consider shifting this workload from %s to a region with lower carbon intensity, such as eu-west-1 or ca-central-1.\n", region)
+		if highestDaily > 0 {
+			fmt.Printf("\n🔥 Top Emitter Detected: %s (%s) emitting %.3f kg CO2/day.\n", topResource.Name, topResource.Instance, highestDaily)
+			aiSuggestion := getAISuggestions(openAIToken, topResource, region, gridIntensity)
+			fmt.Printf("\n🌿 AI GreenOps Recommendation:\n%s\n", aiSuggestion)
 		}
 
-		fmt.Println("\n💡 Architecture Suggestion: Graviton Migration")
-		fmt.Println("   Consider migrating x86 workloads (e.g. m5, t3) to ARM64 Graviton instances (e.g. m6g, t4g) for up to 60% better performance-per-watt.")
+		// Interactive Optimization Loop
+		for {
+			var optChoice string
+			err := huh.NewForm(
+				huh.NewGroup(
+					huh.NewSelect[string]().
+						Title("Apply an Optimization to view Projected Carbon Savings:").
+						Options(
+							huh.NewOption("1. Migrate all compatible instances to Graviton", "graviton"),
+							huh.NewOption("2. Move to a Greener Region", "region"),
+							huh.NewOption("3. Exit", "exit"),
+						).
+						Value(&optChoice),
+				),
+			).Run()
+
+			if err != nil || optChoice == "exit" {
+				fmt.Println("Exiting optimization loop.")
+				break
+			}
+
+			newRegion := region
+			var simPlan TFPlan = plan // Soft copy for simulation
+
+			if optChoice == "graviton" {
+				fmt.Println("\n🔄 Simulating Graviton Migration...")
+				for i, res := range simPlan.PlannedValues.RootModule.Resources {
+					if res.Mode == "managed" {
+						if res.Type == "aws_instance" {
+							if val, ok := res.Values["instance_type"].(string); ok {
+								if strings.Contains(val, "m5.") {
+									simPlan.PlannedValues.RootModule.Resources[i].Values["instance_type"] = strings.Replace(val, "m5.", "m6g.", 1)
+								} else if strings.Contains(val, "t3.") {
+									simPlan.PlannedValues.RootModule.Resources[i].Values["instance_type"] = strings.Replace(val, "t3.", "t4g.", 1)
+								}
+							}
+						} else if res.Type == "aws_db_instance" {
+							if val, ok := res.Values["instance_class"].(string); ok {
+								if strings.Contains(val, "m5.") {
+									simPlan.PlannedValues.RootModule.Resources[i].Values["instance_class"] = strings.Replace(val, "m5.", "m6g.", 1)
+								} else if strings.Contains(val, "t3.") {
+									simPlan.PlannedValues.RootModule.Resources[i].Values["instance_class"] = strings.Replace(val, "t3.", "t4g.", 1)
+								}
+							}
+						}
+					}
+				}
+			} else if optChoice == "region" {
+				huh.NewForm(
+					huh.NewGroup(
+						huh.NewInput().Title("Enter new AWS Region (e.g. eu-west-1, ca-central-1, ap-northeast-3)").Value(&newRegion),
+					),
+				).Run()
+				fmt.Printf("\n🔄 Simulating Move to %s...\n", newRegion)
+			}
+
+			newGridIntensity := getGridIntensity(emToken, newRegion)
+			_, simOps, simEmb := calculateImpact(&simPlan, newRegion, newGridIntensity, embodiedData, vcpuMap, x86Coeff, armCoeff)
+			simTotal := simOps + simEmb
+
+			fmt.Printf("\n📈 Projected Savings after Optimization:\n")
+			fmt.Printf("   Original Total CO2/day: %.3f kg\n", originalTotal)
+			fmt.Printf("   Projected Total CO2/day: %.3f kg\n", simTotal)
+			savings := originalTotal - simTotal
+			percent := (savings / originalTotal) * 100
+			if savings > 0 {
+				fmt.Printf("   ✨ You saved %.3f kg CO2/day (%.1f%% reduction)!\n\n", savings, percent)
+			} else {
+				fmt.Printf("   ⚠️ This optimization increased or did not change emissions.\n\n")
+			}
+		}
 
 	} else {
 		fmt.Println("No Terraform plan provided.")
