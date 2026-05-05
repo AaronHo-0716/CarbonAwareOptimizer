@@ -36,8 +36,23 @@ type TFPlan struct {
 	} `json:"configuration"`
 }
 
+type UseCoeff struct {
+	MinWatts float64
+	MaxWatts float64
+}
+
+type ResourceImpact struct {
+	Type       string
+	Name       string
+	Instance   string
+	Count      int
+	DailyOps   float64
+	DailyEmb   float64
+	TotalDaily float64
+}
+
 func getGridIntensity(token, region string) float64 {
-	// For demo purposes, we will return a mock value if we can't get it from the API
+	// Mock mapping to ElectricityMaps typical intensities (gCO2e/kWh)
 	intensityMap := map[string]float64{
 		"us-east-1":      390.0,
 		"us-west-2":      150.0,
@@ -76,6 +91,90 @@ func parseEmbodiedEmissions() map[string]float64 {
 		embodied[instanceType] = total
 	}
 	return embodied
+}
+
+func parseInstanceVCPUs() map[string]int {
+	vcpus := make(map[string]int)
+	file, err := os.Open("aws-instances-latest-2026.csv")
+	if err != nil {
+		return vcpus
+	}
+	defer file.Close()
+
+	reader := csv.NewReader(file)
+	records, err := reader.ReadAll()
+	if err != nil {
+		return vcpus
+	}
+
+	for i, record := range records {
+		if i == 0 || len(record) < 3 {
+			continue
+		}
+		instanceType := record[1]
+		v, _ := strconv.Atoi(record[2])
+		vcpus[instanceType] = v
+	}
+	return vcpus
+}
+
+func getUseCoefficients() (UseCoeff, UseCoeff) {
+	// Fallback coefficients if file is missing
+	x86 := UseCoeff{MinWatts: 0.8, MaxWatts: 4.0}
+	arm := UseCoeff{MinWatts: 0.47, MaxWatts: 1.7}
+
+	file, err := os.Open("coefficients-aws-use.csv")
+	if err == nil {
+		defer file.Close()
+		reader := csv.NewReader(file)
+		records, err := reader.ReadAll()
+		if err == nil {
+			var x86MinSum, x86MaxSum, armMinSum, armMaxSum float64
+			var x86Count, armCount float64
+			for i, rec := range records {
+				if i == 0 || len(rec) < 4 {
+					continue
+				}
+				minW, _ := strconv.ParseFloat(rec[2], 64)
+				maxW, _ := strconv.ParseFloat(rec[3], 64)
+				arch := strings.ToLower(rec[1])
+
+				if strings.Contains(arch, "graviton") {
+					armMinSum += minW
+					armMaxSum += maxW
+					armCount++
+				} else {
+					x86MinSum += minW
+					x86MaxSum += maxW
+					x86Count++
+				}
+			}
+			if x86Count > 0 {
+				x86.MinWatts = x86MinSum / x86Count
+				x86.MaxWatts = x86MaxSum / x86Count
+			}
+			if armCount > 0 {
+				arm.MinWatts = armMinSum / armCount
+				arm.MaxWatts = armMaxSum / armCount
+			}
+		}
+	}
+	return x86, arm
+}
+
+func getVCPUs(instanceType string, vcpuMap map[string]int) int {
+	if val, ok := vcpuMap[instanceType]; ok {
+		return val
+	}
+	// Rough heuristic fallback
+	if strings.Contains(instanceType, "nano") || strings.Contains(instanceType, "micro") || strings.Contains(instanceType, "small") || strings.Contains(instanceType, "medium") || strings.Contains(instanceType, "large") {
+		return 2
+	} else if strings.Contains(instanceType, "xlarge") {
+		return 4
+	} else if strings.Contains(instanceType, "2xlarge") {
+		return 8
+	}
+	return 2
 }
 
 func main() {
@@ -137,7 +236,10 @@ func main() {
 			os.Exit(1)
 		}
 
+		// Load datasets
 		embodiedData := parseEmbodiedEmissions()
+		vcpuMap := parseInstanceVCPUs()
+		x86Coeff, armCoeff := getUseCoefficients()
 
 		region := "us-east-1" // default
 
@@ -164,9 +266,14 @@ func main() {
 		gridIntensity := getGridIntensity(emToken, region)
 		fmt.Printf("📍 Region identified: %s (Intensity: %.2f gCO2e/kWh)\n\n", region, gridIntensity)
 
-		var dailyOpsEmissions float64
-		var dailyEmbodiedEmissions float64
-		var instanceCount int
+		var totalDailyOps float64
+		var totalDailyEmb float64
+		var totalInstances int
+		var impacts []ResourceImpact
+
+		// Constants for CCF Physics Formula
+		const PUE = 1.135           // Typical AWS PUE
+		const LifespanDays = 1460.0 // 4 years
 
 		for _, res := range plan.PlannedValues.RootModule.Resources {
 			if res.Mode != "managed" {
@@ -185,12 +292,9 @@ func main() {
 					if val, ok := res.Values["desired_capacity"].(float64); ok {
 						count = val
 					}
-					// ASG instance type might be in launch template, which is harder to parse from plan.json without looking up refs.
-					// Fallback mock if needed.
-					iType = "t3.medium"
+					iType = "t3.medium" // Fallback mock for ASG if exact type isn't readily in plan
 				} else if res.Type == "aws_db_instance" {
 					if val, ok := res.Values["instance_class"].(string); ok {
-						// e.g. db.t3.micro -> t3.micro
 						iType = strings.TrimPrefix(val, "db.")
 					}
 				}
@@ -199,36 +303,68 @@ func main() {
 					iType = "m5.large" // Default fallback
 				}
 
-				instanceCount += int(count)
+				totalInstances += int(count)
+				vcpus := float64(getVCPUs(iType, vcpuMap))
 
-				// 1. Embodied calculation
-				// Lifespan = 4 years
-				embodied := embodiedData[iType] // kgCO2e
-				if embodied == 0 {
-					embodied = 1200.0 // Mock fallback 1.2 metric tons = 1200 kg
+				// Determine architecture
+				coeff := x86Coeff
+				if strings.Contains(iType, "g.") || strings.Contains(iType, "g2.") || strings.Contains(iType, "g3.") || strings.Contains(iType, "g4.") {
+					coeff = armCoeff // Graviton
 				}
-				dailyEmbodied := (embodied / (4 * 365)) * count
 
-				// 2. Operational calculation
-				// Estimate daily energy: mock average 3 kWh per day per instance
-				dailyKwh := 3.0 * count
-				dailyOps := (dailyKwh * gridIntensity) / 1000.0 // kgCO2e
+				// 1. Operational Emissions (CCF Formula)
+				// E_daily = (P_min + (P_max - P_min) * 0.5) * 24 * PUE
+				// Note: Coeffs are per vCPU in Watts. We multiply by vCPUs, then divide by 1000 for kWh
+				avgWattsPerVcpu := coeff.MinWatts + (coeff.MaxWatts-coeff.MinWatts)*0.5
+				dailyKwhPerInstance := (avgWattsPerVcpu * vcpus * 24.0 * PUE) / 1000.0
 
-				dailyOpsEmissions += dailyOps
-				dailyEmbodiedEmissions += dailyEmbodied
+				dailyOpsPerInstance := (dailyKwhPerInstance * gridIntensity) / 1000.0 // kgCO2e
+				dailyOps := dailyOpsPerInstance * count
 
-				fmt.Printf("✅ Found %s (%s): %s (x%d)\n", res.Type, res.Name, iType, int(count))
+				// 2. Embodied Emissions
+				embodiedTotal := embodiedData[iType] // kgCO2e
+				if embodiedTotal == 0 {
+					embodiedTotal = 1200.0 // 1.2 metric tons fallback
+				}
+				dailyEmbPerInstance := embodiedTotal / LifespanDays
+				dailyEmb := dailyEmbPerInstance * count
+
+				impacts = append(impacts, ResourceImpact{
+					Type:       res.Type,
+					Name:       res.Name,
+					Instance:   iType,
+					Count:      int(count),
+					DailyOps:   dailyOps,
+					DailyEmb:   dailyEmb,
+					TotalDaily: dailyOps + dailyEmb,
+				})
+
+				totalDailyOps += dailyOps
+				totalDailyEmb += dailyEmb
 			}
 		}
 
-		totalDaily := dailyOpsEmissions + dailyEmbodiedEmissions
+		fmt.Println("📊 --- Granular Resource Carbon Impact Assessment ---")
+		fmt.Printf("%-25s %-25s %-12s %-6s %-10s %-10s %-10s\n", "Type", "Name", "Instance", "Qty", "Ops(kg)", "Emb(kg)", "Total(kg)")
+		fmt.Println(strings.Repeat("-", 103))
 
-		fmt.Println("\n📊 --- Carbon Impact Assessment ---")
-		fmt.Printf("Total Instances Tracked:   %d\n", instanceCount)
-		fmt.Printf("Daily Operational Carbon:  %.2f kgCO2e\n", dailyOpsEmissions)
-		fmt.Printf("Daily Embodied Carbon:     %.2f kgCO2e\n", dailyEmbodiedEmissions)
-		fmt.Printf("Total Daily Footprint:     %.2f kgCO2e\n", totalDaily)
-		fmt.Println("----------------------------------")
+		for _, imp := range impacts {
+			typeShort := imp.Type
+			if len(typeShort) > 23 {
+				typeShort = typeShort[:20] + "..."
+			}
+			nameShort := imp.Name
+			if len(nameShort) > 23 {
+				nameShort = nameShort[:20] + "..."
+			}
+
+			fmt.Printf("%-25s %-25s %-12s %-6d %-10.3f %-10.3f %-10.3f\n",
+				typeShort, nameShort, imp.Instance, imp.Count, imp.DailyOps, imp.DailyEmb, imp.TotalDaily)
+		}
+
+		fmt.Println(strings.Repeat("-", 103))
+		fmt.Printf("%-64s %-6d %-10.3f %-10.3f %-10.3f\n",
+			"TOTALS", totalInstances, totalDailyOps, totalDailyEmb, totalDailyOps+totalDailyEmb)
 
 		// AI / Optimization Heuristics
 		if gridIntensity > 200 {
