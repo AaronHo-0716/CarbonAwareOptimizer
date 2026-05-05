@@ -4,6 +4,7 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -51,21 +52,40 @@ type ResourceImpact struct {
 	TotalDaily float64
 }
 
+type CarbonIntensityResponse struct {
+	CarbonIntensity float64 `json:"carbonIntensity"`
+}
+
 func getGridIntensity(token, region string) float64 {
-	// Mock mapping to ElectricityMaps typical intensities (gCO2e/kWh)
-	intensityMap := map[string]float64{
-		"us-east-1":      390.0,
-		"us-west-2":      150.0,
-		"eu-west-1":      50.0,
-		"ap-southeast-1": 450.0,
-		"ap-southeast-5": 500.0, // mock high intensity
-		"ca-central-1":   25.0,
+	client := &http.Client{}
+
+	url := fmt.Sprintf("https://api.electricitymap.org/v3/carbon-intensity/latest?dataCenterProvider=aws&dataCenterRegion=%s", region)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return 250.0
+	}
+	req.Header.Set("auth-token", token)
+
+	resp, err := client.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		fmt.Printf("⚠️ Could not find or fetch zone mapping for region %s, using global average intensity.\n", region)
+		return 250.0
+	}
+	defer resp.Body.Close()
+
+	var intensityResp CarbonIntensityResponse
+	if err := json.NewDecoder(resp.Body).Decode(&intensityResp); err != nil {
+		return 250.0
 	}
 
-	if val, ok := intensityMap[region]; ok {
-		return val
+	if intensityResp.CarbonIntensity > 0 {
+		return intensityResp.CarbonIntensity
 	}
-	return 250.0 // global average fallback
+
+	return 250.0
 }
 
 func parseEmbodiedEmissions() map[string]float64 {
