@@ -11,23 +11,22 @@ import (
 	"github.com/charmbracelet/huh"
 )
 
-type ElectricityMapsZone struct {
-	ZoneName string  `json:"zoneName"`
-	Carbon   float64 `json:"carbonIntensity"` // Mock or real intensity
-}
-
 type TFPlan struct {
-	ResourceChanges []struct {
-		Type   string `json:"type"`
-		Name   string `json:"name"`
-		Change struct {
-			Actions []string `json:"actions"`
-			After   struct {
-				InstanceType    string      `json:"instance_type"`
-				DesiredCapacity interface{} `json:"desired_capacity"` // can be float64 or int
-			} `json:"after"`
-		} `json:"change"`
-	} `json:"resource_changes"`
+	Variables map[string]struct {
+		Value interface{} `json:"value"`
+	} `json:"variables"`
+	PlannedValues struct {
+		RootModule struct {
+			Resources []struct {
+				Address      string                 `json:"address"`
+				Mode         string                 `json:"mode"`
+				Type         string                 `json:"type"`
+				Name         string                 `json:"name"`
+				ProviderName string                 `json:"provider_name"`
+				Values       map[string]interface{} `json:"values"`
+			} `json:"resources"`
+		} `json:"root_module"`
+	} `json:"planned_values"`
 	Configuration struct {
 		ProviderConfig map[string]struct {
 			Expressions map[string]struct {
@@ -39,12 +38,12 @@ type TFPlan struct {
 
 func getGridIntensity(token, region string) float64 {
 	// For demo purposes, we will return a mock value if we can't get it from the API
-	// AWS region to ElectricityMaps zone mapping is complex, using a rough fallback
 	intensityMap := map[string]float64{
 		"us-east-1":      390.0,
 		"us-west-2":      150.0,
 		"eu-west-1":      50.0,
 		"ap-southeast-1": 450.0,
+		"ap-southeast-5": 500.0, // mock high intensity
 		"ca-central-1":   25.0,
 	}
 
@@ -141,12 +140,22 @@ func main() {
 		embodiedData := parseEmbodiedEmissions()
 
 		region := "us-east-1" // default
-		// try to extract region from configuration
-		for k, v := range plan.Configuration.ProviderConfig {
-			if k == "aws" || k == "aws.default" {
-				if expr, ok := v.Expressions["region"]; ok {
-					if expr.ConstantValue != "" {
-						region = expr.ConstantValue
+
+		// 1. Try variable "aws_region"
+		if v, ok := plan.Variables["aws_region"]; ok {
+			if s, ok := v.Value.(string); ok && s != "" {
+				region = s
+			}
+		}
+
+		// 2. Try to extract region from configuration
+		if region == "us-east-1" {
+			for k, v := range plan.Configuration.ProviderConfig {
+				if k == "aws" || k == "aws.default" {
+					if expr, ok := v.Expressions["region"]; ok {
+						if expr.ConstantValue != "" {
+							region = expr.ConstantValue
+						}
 					}
 				}
 			}
@@ -159,36 +168,35 @@ func main() {
 		var dailyEmbodiedEmissions float64
 		var instanceCount int
 
-		for _, rc := range plan.ResourceChanges {
-			// Only consider resources being created or updated
-			isCreateOrUpdate := false
-			for _, action := range rc.Change.Actions {
-				if action == "create" || action == "update" {
-					isCreateOrUpdate = true
-					break
-				}
-			}
-
-			if !isCreateOrUpdate {
+		for _, res := range plan.PlannedValues.RootModule.Resources {
+			if res.Mode != "managed" {
 				continue
 			}
 
-			if rc.Type == "aws_instance" || rc.Type == "aws_autoscaling_group" {
-				iType := rc.Change.After.InstanceType
-				if iType == "" {
-					iType = "m5.large" // Fallback mock for ASG if not found directly in launch template
+			if res.Type == "aws_instance" || res.Type == "aws_autoscaling_group" || res.Type == "aws_db_instance" {
+				var iType string
+				count := 1.0
+
+				if res.Type == "aws_instance" {
+					if val, ok := res.Values["instance_type"].(string); ok {
+						iType = val
+					}
+				} else if res.Type == "aws_autoscaling_group" {
+					if val, ok := res.Values["desired_capacity"].(float64); ok {
+						count = val
+					}
+					// ASG instance type might be in launch template, which is harder to parse from plan.json without looking up refs.
+					// Fallback mock if needed.
+					iType = "t3.medium"
+				} else if res.Type == "aws_db_instance" {
+					if val, ok := res.Values["instance_class"].(string); ok {
+						// e.g. db.t3.micro -> t3.micro
+						iType = strings.TrimPrefix(val, "db.")
+					}
 				}
 
-				count := 1.0
-				if rc.Type == "aws_autoscaling_group" && rc.Change.After.DesiredCapacity != nil {
-					switch v := rc.Change.After.DesiredCapacity.(type) {
-					case float64:
-						count = v
-					case int:
-						count = float64(v)
-					case string:
-						count, _ = strconv.ParseFloat(v, 64)
-					}
+				if iType == "" {
+					iType = "m5.large" // Default fallback
 				}
 
 				instanceCount += int(count)
@@ -209,7 +217,7 @@ func main() {
 				dailyOpsEmissions += dailyOps
 				dailyEmbodiedEmissions += dailyEmbodied
 
-				fmt.Printf("✅ Found %s: %s (x%d)\n", rc.Type, iType, int(count))
+				fmt.Printf("✅ Found %s (%s): %s (x%d)\n", res.Type, res.Name, iType, int(count))
 			}
 		}
 
@@ -229,7 +237,7 @@ func main() {
 		}
 
 		fmt.Println("\n💡 Architecture Suggestion: Graviton Migration")
-		fmt.Println("   Consider migrating x86 workloads (e.g. m5) to ARM64 Graviton instances (e.g. m6g) for up to 60% better performance-per-watt.")
+		fmt.Println("   Consider migrating x86 workloads (e.g. m5, t3) to ARM64 Graviton instances (e.g. m6g, t4g) for up to 60% better performance-per-watt.")
 
 	} else {
 		fmt.Println("No Terraform plan provided.")
