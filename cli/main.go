@@ -6,9 +6,13 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/huh"
 )
 
@@ -86,6 +90,88 @@ func getGridIntensity(token, region string) float64 {
 	}
 
 	return 250.0
+}
+
+func getGridIntensityQuiet(token, region string) float64 {
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	url := fmt.Sprintf("https://api.electricitymap.org/v3/carbon-intensity/latest?dataCenterProvider=aws&dataCenterRegion=%s", region)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return 250.0
+	}
+	req.Header.Set("auth-token", token)
+
+	resp, err := client.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		return 250.0
+	}
+	defer resp.Body.Close()
+
+	var intensityResp CarbonIntensityResponse
+	if err := json.NewDecoder(resp.Body).Decode(&intensityResp); err != nil {
+		return 250.0
+	}
+
+	if intensityResp.CarbonIntensity > 0 {
+		return intensityResp.CarbonIntensity
+	}
+
+	return 250.0
+}
+
+type RegionIntensity struct {
+	Region    string
+	Intensity float64
+}
+
+func getTopAsianRegions(token string) string {
+	regions := []string{
+		"ap-east-1", "ap-northeast-1", "ap-northeast-2", "ap-northeast-3",
+		"ap-south-1", "ap-south-2", "ap-southeast-1", "ap-southeast-2",
+		"ap-southeast-3", "ap-southeast-4", "ap-southeast-5",
+	}
+
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	var results []RegionIntensity
+
+	for _, r := range regions {
+		wg.Add(1)
+		go func(reg string) {
+			defer wg.Done()
+			intensity := getGridIntensityQuiet(token, reg)
+			if intensity > 0 && intensity != 250.0 { // ignore fallback values
+				mu.Lock()
+				results = append(results, RegionIntensity{Region: reg, Intensity: intensity})
+				mu.Unlock()
+			}
+		}(r)
+	}
+	wg.Wait()
+
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Intensity < results[j].Intensity
+	})
+
+	limit := 5
+	if len(results) < 5 {
+		limit = len(results)
+	}
+
+	if limit == 0 {
+		return ""
+	}
+
+	var sb strings.Builder
+	sb.WriteString("Here are the top greenest Asian regions you can choose from based on live data:\n")
+	for i := 0; i < limit; i++ {
+		sb.WriteString(fmt.Sprintf("- %s: %.2f gCO2e/kWh\n", results[i].Region, results[i].Intensity))
+	}
+	return sb.String()
 }
 
 func parseEmbodiedEmissions() map[string]float64 {
@@ -286,8 +372,15 @@ type AIResponse struct {
 	} `json:"choices"`
 }
 
-func getAISuggestions(apiKey string, topResource ResourceImpact, region string, gridIntensity float64) string {
-	prompt := fmt.Sprintf("You are a GreenOps Specialist. This %s in %s (Grid Intensity: %.2f gCO2e/kWh) produces %.3f kg of CO2 daily. Suggest: 1. A Graviton equivalent, 2. A greener region with lower grid intensity (e.g., if in Asia, suggest a green Asian region like ap-northeast-3 or similar, or global alternatives), and 3. Scheduling or Rightsizing logic.", topResource.Instance, region, gridIntensity, topResource.TotalDaily)
+func getAISuggestions(apiKey string, topResource ResourceImpact, region string, gridIntensity float64, asianContext string) string {
+	var regionPrompt string
+	if asianContext != "" {
+		regionPrompt = fmt.Sprintf("2. A greener region with lower grid intensity. The user is currently in Asia. Use this live data to suggest the best alternative:\n%s", asianContext)
+	} else {
+		regionPrompt = "2. A greener region with lower grid intensity (e.g., if in Asia, suggest a green Asian region like ap-northeast-3 or similar, or global alternatives)."
+	}
+
+	prompt := fmt.Sprintf("You are a GreenOps Specialist. This %s in %s (Grid Intensity: %.2f gCO2e/kWh) produces %.3f kg of CO2 daily. Suggest:\n1. A Graviton equivalent. Explicitly mention the caveats of migrating to Graviton (e.g., which applications can or cannot migrate easily, compiled vs interpreted languages, dependencies).\n%s\n3. Scheduling or Rightsizing logic.", topResource.Instance, region, gridIntensity, topResource.TotalDaily, regionPrompt)
 
 	fmt.Println("\n🤖 Fetching AI Insights...")
 
@@ -296,7 +389,7 @@ func getAISuggestions(apiKey string, topResource ResourceImpact, region string, 
 	}
 
 	reqBody := AIRequest{
-		Model: "gpt-4o-mini",
+		Model: "openai/gpt-4o-mini",
 	}
 	reqBody.Messages = append(reqBody.Messages, struct {
 		Role    string `json:"role"`
@@ -304,9 +397,11 @@ func getAISuggestions(apiKey string, topResource ResourceImpact, region string, 
 	}{Role: "user", Content: prompt})
 
 	jsonBody, _ := json.Marshal(reqBody)
-	req, _ := http.NewRequest("POST", "https://api.openai.com/v1/chat/completions", strings.NewReader(string(jsonBody)))
+	req, _ := http.NewRequest("POST", "https://openrouter.ai/api/v1/chat/completions", strings.NewReader(string(jsonBody)))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("HTTP-Referer", "https://github.com/carbon-optimizer")
+	req.Header.Set("X-Title", "Carbon Optimizer")
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
@@ -325,7 +420,7 @@ func getAISuggestions(apiKey string, topResource ResourceImpact, region string, 
 
 func main() {
 	var emToken string
-	var openAIToken string
+	var openRouterToken string
 	var tfPlanFile string
 
 	if envContent, err := os.ReadFile(".env"); err == nil {
@@ -334,27 +429,27 @@ func main() {
 			if strings.HasPrefix(line, "ELECTRICITYMAPS_TOKEN=") {
 				emToken = strings.TrimPrefix(line, "ELECTRICITYMAPS_TOKEN=")
 			}
-			if strings.HasPrefix(line, "OPENAI_API_KEY=") {
-				openAIToken = strings.TrimPrefix(line, "OPENAI_API_KEY=")
+			if strings.HasPrefix(line, "OPENROUTER_API_KEY=") {
+				openRouterToken = strings.TrimPrefix(line, "OPENROUTER_API_KEY=")
 			}
 		}
 	}
 
-	if openAIToken == "" {
+	if openRouterToken == "" {
 		huh.NewForm(
 			huh.NewGroup(
-				huh.NewInput().Title("OpenAI API Key (optional, press enter to skip)").Value(&openAIToken),
+				huh.NewInput().Title("OpenRouter API Key (optional, press enter to skip)").Value(&openRouterToken),
 			),
 		).Run()
-		if openAIToken != "" && openAIToken != "skip" {
+		if openRouterToken != "" && openRouterToken != "skip" {
 			// Append to .env safely
 			f, err := os.OpenFile(".env", os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
 			if err == nil {
-				f.WriteString(fmt.Sprintf("OPENAI_API_KEY=%s\n", openAIToken))
+				f.WriteString(fmt.Sprintf("OPENROUTER_API_KEY=%s\n", openRouterToken))
 				f.Close()
 			}
 		} else {
-			openAIToken = "skip"
+			openRouterToken = "skip"
 		}
 	}
 
@@ -472,8 +567,21 @@ func main() {
 
 		if highestDaily > 0 {
 			fmt.Printf("\n🔥 Top Emitter Detected: %s (%s) emitting %.3f kg CO2/day.\n", topResource.Name, topResource.Instance, highestDaily)
-			aiSuggestion := getAISuggestions(openAIToken, topResource, region, gridIntensity)
-			fmt.Printf("\n🌿 AI GreenOps Recommendation:\n%s\n", aiSuggestion)
+
+			var asianContext string
+			if strings.HasPrefix(region, "ap-") {
+				fmt.Println("🌏 Asian region detected, discovering the greenest data centers...")
+				asianContext = getTopAsianRegions(emToken)
+			}
+
+			aiSuggestion := getAISuggestions(openRouterToken, topResource, region, gridIntensity, asianContext)
+
+			renderedSuggestion, err := glamour.Render(aiSuggestion, "dark")
+			if err != nil {
+				renderedSuggestion = aiSuggestion
+			}
+
+			fmt.Printf("\n🌿 AI GreenOps Recommendation:\n%s\n", renderedSuggestion)
 		}
 
 		// Interactive Optimization Loop
