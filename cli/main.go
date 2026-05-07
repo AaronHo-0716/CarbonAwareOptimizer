@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -380,7 +382,7 @@ func getAISuggestions(apiKey string, topResource ResourceImpact, region string, 
 		regionPrompt = "2. A greener region with lower grid intensity (e.g., if in Asia, suggest a green Asian region like ap-northeast-3 or similar, or global alternatives)."
 	}
 
-	prompt := fmt.Sprintf("You are a GreenOps Specialist. This %s in %s (Grid Intensity: %.2f gCO2e/kWh) produces %.3f kg of CO2 daily. Suggest:\n1. A Graviton equivalent. Explicitly mention the caveats of migrating to Graviton (e.g., which applications can or cannot migrate easily, compiled vs interpreted languages, dependencies).\n%s\n3. Scheduling or Rightsizing logic.", topResource.Instance, region, gridIntensity, topResource.TotalDaily, regionPrompt)
+	prompt := fmt.Sprintf("You are a GreenOps Specialist. This %s in %s (Grid Intensity: %.2f gCO2e/kWh) produces %.3f kg of CO2 daily (Operations: %.3f kg, Embodied: %.3f kg, assuming a 4-year hardware lifespan). Suggest:\n1. A Graviton equivalent. Explicitly mention the caveats of migrating to Graviton (e.g., which applications can or cannot migrate easily, compiled vs interpreted languages, dependencies).\n%s\n3. Scheduling or Rightsizing logic.", topResource.Instance, region, gridIntensity, topResource.TotalDaily, topResource.DailyOps, topResource.DailyEmb, regionPrompt)
 
 	fmt.Println("\n🤖 Fetching AI Insights...")
 
@@ -421,7 +423,7 @@ func getAISuggestions(apiKey string, topResource ResourceImpact, region string, 
 func main() {
 	var emToken string
 	var openRouterToken string
-	var tfPlanFile string
+	var tfInput string
 
 	if envContent, err := os.ReadFile(".env"); err == nil {
 		content := string(envContent)
@@ -471,192 +473,241 @@ func main() {
 	}
 
 	if len(os.Args) > 1 {
-		tfPlanFile = os.Args[1]
+		tfInput = os.Args[1]
 	} else {
 		huh.NewForm(
 			huh.NewGroup(
-				huh.NewInput().Title("Terraform Plan JSON file path").Value(&tfPlanFile),
+				huh.NewInput().Title("Terraform Plan JSON or Project Directory").Value(&tfInput),
 			),
 		).Run()
+	}
+
+	if tfInput == "" {
+		tfInput = "." // default to current directory
 	}
 
 	fmt.Println("🌍 Carbon Optimizer - Static Infrastructure Carbon Estimator")
 	fmt.Println("🔑 API Key configured for ElectricityMaps.")
 
-	if tfPlanFile != "" {
-		fmt.Printf("📄 Analyzing Terraform Plan: %s\n", tfPlanFile)
+	fmt.Printf("📄 Analyzing Terraform Input: %s\n", tfInput)
 
-		planData, err := os.ReadFile(tfPlanFile)
+	var planData []byte
+	info, err := os.Stat(tfInput)
+	if err != nil {
+		fmt.Printf("❌ Failed to access input path: %v\n", err)
+		os.Exit(1)
+	}
+
+	if !info.IsDir() && strings.HasSuffix(tfInput, ".json") {
+		// It's a pre-computed JSON plan
+		planData, err = os.ReadFile(tfInput)
 		if err != nil {
 			fmt.Printf("❌ Failed to read plan file: %v\n", err)
 			os.Exit(1)
 		}
+	} else {
+		// It's a directory or a .tf file, run Terraform
+		dir := tfInput
+		if !info.IsDir() {
+			dir = filepath.Dir(tfInput)
+		}
 
-		var plan TFPlan
-		if err := json.Unmarshal(planData, &plan); err != nil {
-			fmt.Printf("❌ Failed to parse plan JSON: %v\n", err)
+		if _, err := exec.LookPath("terraform"); err != nil {
+			fmt.Println("❌ Terraform CLI not found in PATH. Please install terraform or provide a pre-computed plan.json.")
 			os.Exit(1)
 		}
 
-		// Load datasets
-		embodiedData := parseEmbodiedEmissions()
-		vcpuMap := parseInstanceVCPUs()
-		x86Coeff, armCoeff := getUseCoefficients()
-
-		region := "us-east-1" // default
-
-		// 1. Try variable "aws_region"
-		if v, ok := plan.Variables["aws_region"]; ok {
-			if s, ok := v.Value.(string); ok && s != "" {
-				region = s
-			}
+		fmt.Println("⚙️  Running 'terraform init'...")
+		cmdInit := exec.Command("terraform", "init")
+		cmdInit.Dir = dir
+		if out, err := cmdInit.CombinedOutput(); err != nil {
+			fmt.Printf("❌ Terraform init failed:\n%s\n", string(out))
+			os.Exit(1)
 		}
 
-		// 2. Try to extract region from configuration
-		if region == "us-east-1" {
-			for k, v := range plan.Configuration.ProviderConfig {
-				if k == "aws" || k == "aws.default" {
-					if expr, ok := v.Expressions["region"]; ok {
-						if expr.ConstantValue != "" {
-							region = expr.ConstantValue
-						}
+		fmt.Println("⚙️  Running 'terraform plan'...")
+		planFile := ".carbon_plan.tfplan"
+		cmdPlan := exec.Command("terraform", "plan", "-out="+planFile)
+		cmdPlan.Dir = dir
+		if out, err := cmdPlan.CombinedOutput(); err != nil {
+			fmt.Printf("❌ Terraform plan failed:\n%s\n", string(out))
+			os.Exit(1)
+		}
+		defer os.Remove(filepath.Join(dir, planFile))
+
+		cmdShow := exec.Command("terraform", "show", "-json", planFile)
+		cmdShow.Dir = dir
+		showOut, err := cmdShow.Output()
+		if err != nil {
+			fmt.Printf("❌ Terraform show failed: %v\n", err)
+			os.Exit(1)
+		}
+		planData = showOut
+	}
+
+	var plan TFPlan
+	if err := json.Unmarshal(planData, &plan); err != nil {
+		fmt.Printf("❌ Failed to parse plan JSON: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Load datasets
+	embodiedData := parseEmbodiedEmissions()
+	vcpuMap := parseInstanceVCPUs()
+	x86Coeff, armCoeff := getUseCoefficients()
+
+	region := "us-east-1" // default
+
+	// 1. Try variable "aws_region"
+	if v, ok := plan.Variables["aws_region"]; ok {
+		if s, ok := v.Value.(string); ok && s != "" {
+			region = s
+		}
+	}
+
+	// 2. Try to extract region from configuration
+	if region == "us-east-1" {
+		for k, v := range plan.Configuration.ProviderConfig {
+			if k == "aws" || k == "aws.default" {
+				if expr, ok := v.Expressions["region"]; ok {
+					if expr.ConstantValue != "" {
+						region = expr.ConstantValue
 					}
 				}
 			}
 		}
+	}
 
-		gridIntensity := getGridIntensity(emToken, region)
-		fmt.Printf("📍 Region identified: %s (Intensity: %.2f gCO2e/kWh)\n\n", region, gridIntensity)
+	gridIntensity := getGridIntensity(emToken, region)
+	fmt.Printf("📍 Region identified: %s (Intensity: %.2f gCO2e/kWh)\n\n", region, gridIntensity)
 
-		impacts, totalDailyOps, totalDailyEmb := calculateImpact(&plan, region, gridIntensity, embodiedData, vcpuMap, x86Coeff, armCoeff)
+	impacts, totalDailyOps, totalDailyEmb := calculateImpact(&plan, region, gridIntensity, embodiedData, vcpuMap, x86Coeff, armCoeff)
 
-		totalInstances := 0
-		var topResource ResourceImpact
-		highestDaily := -1.0
+	totalInstances := 0
+	var topResource ResourceImpact
+	highestDaily := -1.0
 
-		for _, imp := range impacts {
-			totalInstances += imp.Count
-			if imp.TotalDaily > highestDaily {
-				highestDaily = imp.TotalDaily
-				topResource = imp
-			}
+	for _, imp := range impacts {
+		totalInstances += imp.Count
+		if imp.TotalDaily > highestDaily {
+			highestDaily = imp.TotalDaily
+			topResource = imp
+		}
+	}
+
+	fmt.Println("📊 --- Granular Resource Carbon Impact Assessment ---")
+	fmt.Printf("%-25s %-25s %-12s %-6s %-10s %-10s %-10s\n", "Type", "Name", "Instance", "Qty", "Ops(kg)", "Emb(kg)", "Total(kg)")
+	fmt.Println(strings.Repeat("-", 103))
+
+	for _, imp := range impacts {
+		typeShort := imp.Type
+		if len(typeShort) > 23 {
+			typeShort = typeShort[:20] + "..."
+		}
+		nameShort := imp.Name
+		if len(nameShort) > 23 {
+			nameShort = nameShort[:20] + "..."
 		}
 
-		fmt.Println("📊 --- Granular Resource Carbon Impact Assessment ---")
-		fmt.Printf("%-25s %-25s %-12s %-6s %-10s %-10s %-10s\n", "Type", "Name", "Instance", "Qty", "Ops(kg)", "Emb(kg)", "Total(kg)")
-		fmt.Println(strings.Repeat("-", 103))
+		fmt.Printf("%-25s %-25s %-12s %-6d %-10.3f %-10.3f %-10.3f\n",
+			typeShort, nameShort, imp.Instance, imp.Count, imp.DailyOps, imp.DailyEmb, imp.TotalDaily)
+	}
 
-		for _, imp := range impacts {
-			typeShort := imp.Type
-			if len(typeShort) > 23 {
-				typeShort = typeShort[:20] + "..."
-			}
-			nameShort := imp.Name
-			if len(nameShort) > 23 {
-				nameShort = nameShort[:20] + "..."
-			}
+	fmt.Println(strings.Repeat("-", 103))
+	originalTotal := totalDailyOps + totalDailyEmb
+	fmt.Printf("%-64s %-6d %-10.3f %-10.3f %-10.3f\n",
+		"TOTALS", totalInstances, totalDailyOps, totalDailyEmb, originalTotal)
 
-			fmt.Printf("%-25s %-25s %-12s %-6d %-10.3f %-10.3f %-10.3f\n",
-				typeShort, nameShort, imp.Instance, imp.Count, imp.DailyOps, imp.DailyEmb, imp.TotalDaily)
+	if highestDaily > 0 {
+		fmt.Printf("\n🔥 Top Emitter Detected: %s (%s) emitting %.3f kg CO2/day (Operations: %.3f kg, Embodied: %.3f kg, assuming a 4-year hardware lifespan).\n",
+			topResource.Name, topResource.Instance, highestDaily, topResource.DailyOps, topResource.DailyEmb)
+
+		var asianContext string
+		if strings.HasPrefix(region, "ap-") {
+			fmt.Println("🌏 Asian region detected, discovering the greenest data centers...")
+			asianContext = getTopAsianRegions(emToken)
 		}
 
-		fmt.Println(strings.Repeat("-", 103))
-		originalTotal := totalDailyOps + totalDailyEmb
-		fmt.Printf("%-64s %-6d %-10.3f %-10.3f %-10.3f\n",
-			"TOTALS", totalInstances, totalDailyOps, totalDailyEmb, originalTotal)
+		aiSuggestion := getAISuggestions(openRouterToken, topResource, region, gridIntensity, asianContext)
 
-		if highestDaily > 0 {
-			fmt.Printf("\n🔥 Top Emitter Detected: %s (%s) emitting %.3f kg CO2/day.\n", topResource.Name, topResource.Instance, highestDaily)
-
-			var asianContext string
-			if strings.HasPrefix(region, "ap-") {
-				fmt.Println("🌏 Asian region detected, discovering the greenest data centers...")
-				asianContext = getTopAsianRegions(emToken)
-			}
-
-			aiSuggestion := getAISuggestions(openRouterToken, topResource, region, gridIntensity, asianContext)
-
-			renderedSuggestion, err := glamour.Render(aiSuggestion, "dark")
-			if err != nil {
-				renderedSuggestion = aiSuggestion
-			}
-
-			fmt.Printf("\n🌿 AI GreenOps Recommendation:\n%s\n", renderedSuggestion)
+		renderedSuggestion, err := glamour.Render(aiSuggestion, "dark")
+		if err != nil {
+			renderedSuggestion = aiSuggestion
 		}
 
-		// Interactive Optimization Loop
-		for {
-			var optChoice string
-			err := huh.NewForm(
+		fmt.Printf("\n🌿 AI GreenOps Recommendation:\n%s\n", renderedSuggestion)
+	}
+
+	// Interactive Optimization Loop
+	for {
+		var optChoice string
+		err := huh.NewForm(
+			huh.NewGroup(
+				huh.NewSelect[string]().
+					Title("Apply an Optimization to view Projected Carbon Savings:").
+					Options(
+						huh.NewOption("1. Migrate all compatible instances to Graviton", "graviton"),
+						huh.NewOption("2. Move to a Greener Region", "region"),
+						huh.NewOption("3. Exit", "exit"),
+					).
+					Value(&optChoice),
+			),
+		).Run()
+
+		if err != nil || optChoice == "exit" {
+			fmt.Println("Exiting optimization loop.")
+			break
+		}
+
+		newRegion := region
+		var simPlan TFPlan = plan // Soft copy for simulation
+
+		if optChoice == "graviton" {
+			fmt.Println("\n🔄 Simulating Graviton Migration...")
+			for i, res := range simPlan.PlannedValues.RootModule.Resources {
+				if res.Mode == "managed" {
+					if res.Type == "aws_instance" {
+						if val, ok := res.Values["instance_type"].(string); ok {
+							if strings.Contains(val, "m5.") {
+								simPlan.PlannedValues.RootModule.Resources[i].Values["instance_type"] = strings.Replace(val, "m5.", "m6g.", 1)
+							} else if strings.Contains(val, "t3.") {
+								simPlan.PlannedValues.RootModule.Resources[i].Values["instance_type"] = strings.Replace(val, "t3.", "t4g.", 1)
+							}
+						}
+					} else if res.Type == "aws_db_instance" {
+						if val, ok := res.Values["instance_class"].(string); ok {
+							if strings.Contains(val, "m5.") {
+								simPlan.PlannedValues.RootModule.Resources[i].Values["instance_class"] = strings.Replace(val, "m5.", "m6g.", 1)
+							} else if strings.Contains(val, "t3.") {
+								simPlan.PlannedValues.RootModule.Resources[i].Values["instance_class"] = strings.Replace(val, "t3.", "t4g.", 1)
+							}
+						}
+					}
+				}
+			}
+		} else if optChoice == "region" {
+			huh.NewForm(
 				huh.NewGroup(
-					huh.NewSelect[string]().
-						Title("Apply an Optimization to view Projected Carbon Savings:").
-						Options(
-							huh.NewOption("1. Migrate all compatible instances to Graviton", "graviton"),
-							huh.NewOption("2. Move to a Greener Region", "region"),
-							huh.NewOption("3. Exit", "exit"),
-						).
-						Value(&optChoice),
+					huh.NewInput().Title("Enter new AWS Region (e.g. eu-west-1, ca-central-1, ap-northeast-3)").Value(&newRegion),
 				),
 			).Run()
-
-			if err != nil || optChoice == "exit" {
-				fmt.Println("Exiting optimization loop.")
-				break
-			}
-
-			newRegion := region
-			var simPlan TFPlan = plan // Soft copy for simulation
-
-			if optChoice == "graviton" {
-				fmt.Println("\n🔄 Simulating Graviton Migration...")
-				for i, res := range simPlan.PlannedValues.RootModule.Resources {
-					if res.Mode == "managed" {
-						if res.Type == "aws_instance" {
-							if val, ok := res.Values["instance_type"].(string); ok {
-								if strings.Contains(val, "m5.") {
-									simPlan.PlannedValues.RootModule.Resources[i].Values["instance_type"] = strings.Replace(val, "m5.", "m6g.", 1)
-								} else if strings.Contains(val, "t3.") {
-									simPlan.PlannedValues.RootModule.Resources[i].Values["instance_type"] = strings.Replace(val, "t3.", "t4g.", 1)
-								}
-							}
-						} else if res.Type == "aws_db_instance" {
-							if val, ok := res.Values["instance_class"].(string); ok {
-								if strings.Contains(val, "m5.") {
-									simPlan.PlannedValues.RootModule.Resources[i].Values["instance_class"] = strings.Replace(val, "m5.", "m6g.", 1)
-								} else if strings.Contains(val, "t3.") {
-									simPlan.PlannedValues.RootModule.Resources[i].Values["instance_class"] = strings.Replace(val, "t3.", "t4g.", 1)
-								}
-							}
-						}
-					}
-				}
-			} else if optChoice == "region" {
-				huh.NewForm(
-					huh.NewGroup(
-						huh.NewInput().Title("Enter new AWS Region (e.g. eu-west-1, ca-central-1, ap-northeast-3)").Value(&newRegion),
-					),
-				).Run()
-				fmt.Printf("\n🔄 Simulating Move to %s...\n", newRegion)
-			}
-
-			newGridIntensity := getGridIntensity(emToken, newRegion)
-			_, simOps, simEmb := calculateImpact(&simPlan, newRegion, newGridIntensity, embodiedData, vcpuMap, x86Coeff, armCoeff)
-			simTotal := simOps + simEmb
-
-			fmt.Printf("\n📈 Projected Savings after Optimization:\n")
-			fmt.Printf("   Original Total CO2/day: %.3f kg\n", originalTotal)
-			fmt.Printf("   Projected Total CO2/day: %.3f kg\n", simTotal)
-			savings := originalTotal - simTotal
-			percent := (savings / originalTotal) * 100
-			if savings > 0 {
-				fmt.Printf("   ✨ You saved %.3f kg CO2/day (%.1f%% reduction)!\n\n", savings, percent)
-			} else {
-				fmt.Printf("   ⚠️ This optimization increased or did not change emissions.\n\n")
-			}
+			fmt.Printf("\n🔄 Simulating Move to %s...\n", newRegion)
 		}
 
-	} else {
-		fmt.Println("No Terraform plan provided.")
+		newGridIntensity := getGridIntensity(emToken, newRegion)
+		_, simOps, simEmb := calculateImpact(&simPlan, newRegion, newGridIntensity, embodiedData, vcpuMap, x86Coeff, armCoeff)
+		simTotal := simOps + simEmb
+
+		fmt.Printf("\n📈 Projected Savings after Optimization:\n")
+		fmt.Printf("   Original Total CO2/day: %.3f kg\n", originalTotal)
+		fmt.Printf("   Projected Total CO2/day: %.3f kg\n", simTotal)
+		savings := originalTotal - simTotal
+		percent := (savings / originalTotal) * 100
+		if savings > 0 {
+			fmt.Printf("   ✨ You saved %.3f kg CO2/day (%.1f%% reduction)!\n\n", savings, percent)
+		} else {
+			fmt.Printf("   ⚠️ This optimization increased or did not change emissions.\n\n")
+		}
 	}
+
 }
