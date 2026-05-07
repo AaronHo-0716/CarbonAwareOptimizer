@@ -130,18 +130,76 @@ type RegionIntensity struct {
 	Intensity float64
 }
 
-func getTopAsianRegions(token string) string {
-	regions := []string{
-		"ap-east-1", "ap-northeast-1", "ap-northeast-2", "ap-northeast-3",
-		"ap-south-1", "ap-south-2", "ap-southeast-1", "ap-southeast-2",
-		"ap-southeast-3", "ap-southeast-4", "ap-southeast-5",
+var regionGroups = map[string][]string{
+	"americas":           {"us-east-1", "us-east-2", "us-west-1", "us-west-2", "ca-central-1", "ca-west-1", "mx-central-1", "sa-east-1"},
+	"europe":             {"eu-central-1", "eu-west-1", "eu-west-2", "eu-south-1", "eu-west-3", "eu-south-2", "eu-north-1", "eu-central-2"},
+	"asia-pacific":       {"ap-east-1", "ap-south-2", "ap-southeast-3", "ap-southeast-5", "ap-southeast-4", "ap-south-1", "ap-northeast-3", "ap-northeast-2", "ap-southeast-2", "ap-southeast-7", "ap-northeast-1", "ap-southeast-1", "ap-southeast-6"},
+	"middle-east-africa": {"af-south-1", "il-central-1", "me-central-1", "me-south-1"},
+}
+
+var awsRegionNames = map[string]string{
+	"af-south-1":     "Cape Town",
+	"ap-east-1":      "Hong Kong",
+	"ap-northeast-1": "Tokyo",
+	"ap-northeast-2": "Seoul",
+	"ap-northeast-3": "Osaka",
+	"ap-south-1":     "Mumbai",
+	"ap-south-2":     "Hyderabad",
+	"ap-southeast-1": "Singapore",
+	"ap-southeast-2": "Sydney",
+	"ap-southeast-3": "Jakarta",
+	"ap-southeast-4": "Melbourne",
+	"ap-southeast-5": "Malaysia",
+	"ap-southeast-6": "New Zealand",
+	"ap-southeast-7": "Thailand",
+	"ca-central-1":   "Canada Central",
+	"ca-west-1":      "Calgary",
+	"eu-central-1":   "Frankfurt",
+	"eu-central-2":   "Zurich",
+	"eu-north-1":     "Stockholm",
+	"eu-south-1":     "Milan",
+	"eu-south-2":     "Spain",
+	"eu-west-1":      "Ireland",
+	"eu-west-2":      "London",
+	"eu-west-3":      "Paris",
+	"il-central-1":   "Tel Aviv",
+	"me-central-1":   "UAE",
+	"me-south-1":     "Bahrain",
+	"mx-central-1":   "Mexico Central",
+	"sa-east-1":      "São Paulo",
+	"us-east-1":      "N. Virginia",
+	"us-east-2":      "Ohio",
+	"us-west-1":      "N. California",
+	"us-west-2":      "Oregon",
+}
+
+func getRegionGroup(region string) []string {
+	if strings.HasPrefix(region, "us-") || strings.HasPrefix(region, "ca-") || strings.HasPrefix(region, "sa-") {
+		return regionGroups["americas"]
 	}
+	if strings.HasPrefix(region, "eu-") || strings.HasPrefix(region, "uk-") {
+		return regionGroups["europe"]
+	}
+	if strings.HasPrefix(region, "ap-") {
+		return regionGroups["asia-pacific"]
+	}
+	if strings.HasPrefix(region, "me-") || strings.HasPrefix(region, "af-") {
+		return regionGroups["middle-east-africa"]
+	}
+	return []string{"us-east-1", "us-west-2", "eu-west-1", "ap-northeast-1", "ap-southeast-1"}
+}
+
+func printRegionalMatrix(token string, currentRegion string, currentIntensity float64, currentOps float64, plan TFPlan, embodiedData map[string]float64, vcpuMap map[string]int, x86Coeff, armCoeff UseCoeff) string {
+	group := getRegionGroup(currentRegion)
 
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	var results []RegionIntensity
 
-	for _, r := range regions {
+	for _, r := range group {
+		if r == currentRegion {
+			continue
+		}
 		wg.Add(1)
 		go func(reg string) {
 			defer wg.Done()
@@ -155,25 +213,77 @@ func getTopAsianRegions(token string) string {
 	}
 	wg.Wait()
 
+	results = append(results, RegionIntensity{Region: currentRegion, Intensity: currentIntensity})
+
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].Intensity < results[j].Intensity
 	})
 
 	limit := 5
-	if len(results) < 5 {
+	if len(results) < limit {
 		limit = len(results)
 	}
+	topResults := results[:limit]
 
-	if limit == 0 {
-		return ""
+	currentInTop := false
+	for _, r := range topResults {
+		if r.Region == currentRegion {
+			currentInTop = true
+			break
+		}
+	}
+	if !currentInTop {
+		topResults = append(topResults, RegionIntensity{Region: currentRegion, Intensity: currentIntensity})
+		sort.Slice(topResults, func(i, j int) bool {
+			return topResults[i].Intensity < topResults[j].Intensity
+		})
 	}
 
-	var sb strings.Builder
-	sb.WriteString("Here are the top greenest Asian regions you can choose from based on live data:\n")
-	for i := 0; i < limit; i++ {
-		sb.WriteString(fmt.Sprintf("- %s: %.2f gCO2e/kWh\n", results[i].Region, results[i].Intensity))
+	fmt.Println("\n📊 --- Regional Trade-off Matrix ---")
+	fmt.Printf("%-35s %-16s %-25s %-20s\n", "Region", "Grid Intensity", "Projected Daily Carbon", "Ops Delta from Current")
+	fmt.Println(strings.Repeat("-", 100))
+
+	var aiContextBuilder strings.Builder
+	aiContextBuilder.WriteString("Live Regional Trade-off Matrix:\n")
+
+	for _, res := range topResults {
+		_, simOps, simEmb := calculateImpact(&plan, res.Region, res.Intensity, embodiedData, vcpuMap, x86Coeff, armCoeff)
+		simTotal := simOps + simEmb
+
+		regionName := res.Region
+		if loc, ok := awsRegionNames[res.Region]; ok {
+			regionName = fmt.Sprintf("%s (%s)", res.Region, loc)
+		}
+
+		if res.Region == currentRegion {
+			regionName += " [Current]"
+		}
+
+		deltaStr := "-"
+		if res.Region != currentRegion {
+			var deltaPct float64
+			if currentOps > 0 {
+				deltaPct = ((simOps - currentOps) / currentOps) * 100
+			}
+			if deltaPct > 0 {
+				deltaStr = fmt.Sprintf("+%.1f%%", deltaPct)
+			} else {
+				deltaStr = fmt.Sprintf("%.1f%%", deltaPct)
+			}
+		}
+
+		// Ensure it doesn't break table alignment if string is too long
+		displayReg := regionName
+		if len(displayReg) > 33 {
+			displayReg = displayReg[:30] + "..."
+		}
+
+		fmt.Printf("%-35s %-13.2f g %-22.3f kg %-20s\n", displayReg, res.Intensity, simTotal, deltaStr)
+		aiContextBuilder.WriteString(fmt.Sprintf("- %s: %.2f gCO2e/kWh, %.3f kg Total CO2/day (Ops Delta: %s)\n", regionName, res.Intensity, simTotal, deltaStr))
 	}
-	return sb.String()
+	fmt.Println(strings.Repeat("-", 100))
+
+	return aiContextBuilder.String()
 }
 
 func parseEmbodiedEmissions() map[string]float64 {
@@ -374,13 +484,8 @@ type AIResponse struct {
 	} `json:"choices"`
 }
 
-func getAISuggestions(apiKey string, topResource ResourceImpact, region string, gridIntensity float64, asianContext string) string {
-	var regionPrompt string
-	if asianContext != "" {
-		regionPrompt = fmt.Sprintf("2. A greener region with lower grid intensity. The user is currently in Asia. Use this live data to suggest the best alternative:\n%s", asianContext)
-	} else {
-		regionPrompt = "2. A greener region with lower grid intensity (e.g., if in Asia, suggest a green Asian region like ap-northeast-3 or similar, or global alternatives)."
-	}
+func getAISuggestions(apiKey string, topResource ResourceImpact, region string, gridIntensity float64, matrixContext string) string {
+	regionPrompt := fmt.Sprintf("2. A greener region with lower grid intensity. Use this live regional trade-off data to suggest the best alternative in the same continent:\n%s", matrixContext)
 
 	prompt := fmt.Sprintf("You are a GreenOps Specialist. This %s in %s (Grid Intensity: %.2f gCO2e/kWh) produces %.3f kg of CO2 daily (Operations: %.3f kg, Embodied: %.3f kg, assuming a 4-year hardware lifespan). Suggest:\n1. A Graviton equivalent. Explicitly mention the caveats of migrating to Graviton (e.g., which applications can or cannot migrate easily, compiled vs interpreted languages, dependencies).\n%s\n3. Scheduling or Rightsizing logic.", topResource.Instance, region, gridIntensity, topResource.TotalDaily, topResource.DailyOps, topResource.DailyEmb, regionPrompt)
 
@@ -622,13 +727,10 @@ func main() {
 		fmt.Printf("\n🔥 Top Emitter Detected: %s (%s) emitting %.3f kg CO2/day (Operations: %.3f kg, Embodied: %.3f kg, assuming a 4-year hardware lifespan).\n",
 			topResource.Name, topResource.Instance, highestDaily, topResource.DailyOps, topResource.DailyEmb)
 
-		var asianContext string
-		if strings.HasPrefix(region, "ap-") {
-			fmt.Println("🌏 Asian region detected, discovering the greenest data centers...")
-			asianContext = getTopAsianRegions(emToken)
-		}
+		fmt.Println("\n🌍 Discovering Regional Trade-off Matrix (same continent)...")
+		matrixContext := printRegionalMatrix(emToken, region, gridIntensity, totalDailyOps, plan, embodiedData, vcpuMap, x86Coeff, armCoeff)
 
-		aiSuggestion := getAISuggestions(openRouterToken, topResource, region, gridIntensity, asianContext)
+		aiSuggestion := getAISuggestions(openRouterToken, topResource, region, gridIntensity, matrixContext)
 
 		renderedSuggestion, err := glamour.Render(aiSuggestion, "dark")
 		if err != nil {
@@ -694,17 +796,33 @@ func main() {
 			fmt.Printf("\n🔄 Simulating Move to %s...\n", newRegion)
 		}
 
-		newGridIntensity := getGridIntensity(emToken, newRegion)
+		newGridIntensity := getGridIntensityQuiet(emToken, newRegion)
 		_, simOps, simEmb := calculateImpact(&simPlan, newRegion, newGridIntensity, embodiedData, vcpuMap, x86Coeff, armCoeff)
 		simTotal := simOps + simEmb
 
 		fmt.Printf("\n📈 Projected Savings after Optimization:\n")
-		fmt.Printf("   Original Total CO2/day: %.3f kg\n", originalTotal)
-		fmt.Printf("   Projected Total CO2/day: %.3f kg\n", simTotal)
+		fmt.Printf("   Original Total CO2/day:  %.3f kg (Ops: %.3f kg, Emb: %.3f kg)\n", originalTotal, totalDailyOps, totalDailyEmb)
+		fmt.Printf("   Projected Total CO2/day: %.3f kg (Ops: %.3f kg, Emb: %.3f kg)\n", simTotal, simOps, simEmb)
+
 		savings := originalTotal - simTotal
-		percent := (savings / originalTotal) * 100
+		opsSavings := totalDailyOps - simOps
+
+		var percentOps float64
+		if totalDailyOps > 0 {
+			percentOps = (opsSavings / totalDailyOps) * 100
+		}
+
+		var percentTotal float64
+		if originalTotal > 0 {
+			percentTotal = (savings / originalTotal) * 100
+		}
+
 		if savings > 0 {
-			fmt.Printf("   ✨ You saved %.3f kg CO2/day (%.1f%% reduction)!\n\n", savings, percent)
+			if optChoice == "region" {
+				fmt.Printf("   ✨ You saved %.3f kg Operations CO2/day (%.1f%% Ops reduction)!\n\n", opsSavings, percentOps)
+			} else {
+				fmt.Printf("   ✨ You saved %.3f kg Total CO2/day (%.1f%% reduction)!\n\n", savings, percentTotal)
+			}
 		} else {
 			fmt.Printf("   ⚠️ This optimization increased or did not change emissions.\n\n")
 		}
