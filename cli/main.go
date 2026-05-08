@@ -14,8 +14,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/charmbracelet/bubbles/table"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/huh"
+	"github.com/charmbracelet/lipgloss"
 )
 
 type TFPlan struct {
@@ -189,7 +192,7 @@ func getRegionGroup(region string) []string {
 	return []string{"us-east-1", "us-west-2", "eu-west-1", "ap-northeast-1", "ap-southeast-1"}
 }
 
-func printRegionalMatrix(token string, currentRegion string, currentIntensity float64, currentOps float64, plan TFPlan, embodiedData map[string]float64, vcpuMap map[string]int, x86Coeff, armCoeff UseCoeff) string {
+func printRegionalMatrix(token string, currentRegion string, currentIntensity float64, currentOps float64, plan TFPlan, embodiedData map[string]float64, vcpuMap map[string]int, x86Coeff, armCoeff UseCoeff, networkProfile string, lambdaInvocations int) string {
 	group := getRegionGroup(currentRegion)
 
 	var mu sync.Mutex
@@ -239,15 +242,19 @@ func printRegionalMatrix(token string, currentRegion string, currentIntensity fl
 		})
 	}
 
-	fmt.Println("\n📊 --- Regional Trade-off Matrix ---")
-	fmt.Printf("%-35s %-16s %-25s %-20s\n", "Region", "Grid Intensity", "Projected Daily Carbon", "Ops Delta from Current")
-	fmt.Println(strings.Repeat("-", 100))
-
 	var aiContextBuilder strings.Builder
 	aiContextBuilder.WriteString("Live Regional Trade-off Matrix:\n")
 
+	columns := []table.Column{
+		{Title: "Region", Width: 35},
+		{Title: "Grid Intensity (g)", Width: 18},
+		{Title: "Projected Daily (kg)", Width: 22},
+		{Title: "Ops Delta", Width: 15},
+	}
+
+	var rows []table.Row
 	for _, res := range topResults {
-		_, simOps, simEmb := calculateImpact(&plan, res.Region, res.Intensity, embodiedData, vcpuMap, x86Coeff, armCoeff)
+		_, simOps, simEmb := calculateImpact(&plan, res.Region, res.Intensity, embodiedData, vcpuMap, x86Coeff, armCoeff, networkProfile, lambdaInvocations)
 		simTotal := simOps + simEmb
 
 		regionName := res.Region
@@ -272,16 +279,39 @@ func printRegionalMatrix(token string, currentRegion string, currentIntensity fl
 			}
 		}
 
-		// Ensure it doesn't break table alignment if string is too long
 		displayReg := regionName
 		if len(displayReg) > 33 {
 			displayReg = displayReg[:30] + "..."
 		}
 
-		fmt.Printf("%-35s %-13.2f g %-22.3f kg %-20s\n", displayReg, res.Intensity, simTotal, deltaStr)
+		rows = append(rows, table.Row{
+			displayReg,
+			fmt.Sprintf("%.2f", res.Intensity),
+			fmt.Sprintf("%.3f", simTotal),
+			deltaStr,
+		})
+
 		aiContextBuilder.WriteString(fmt.Sprintf("- %s: %.2f gCO2e/kWh, %.3f kg Total CO2/day (Ops Delta: %s)\n", regionName, res.Intensity, simTotal, deltaStr))
 	}
-	fmt.Println(strings.Repeat("-", 100))
+
+	t := table.New(
+		table.WithColumns(columns),
+		table.WithRows(rows),
+		table.WithHeight(len(rows)),
+	)
+
+	s := table.DefaultStyles()
+	s.Header = s.Header.BorderStyle(lipgloss.NormalBorder()).BorderForeground(lipgloss.Color("240")).BorderBottom(true).Bold(true)
+	s.Selected = s.Selected.Foreground(lipgloss.Color("229")).Background(lipgloss.Color("57")).Bold(false)
+	t.SetStyles(s)
+
+	box := lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("62")).
+		Padding(1, 2).
+		Render(fmt.Sprintf("📊 --- Regional Trade-off Matrix ---\n\n%s", t.View()))
+
+	fmt.Println(box)
 
 	return aiContextBuilder.String()
 }
@@ -395,7 +425,7 @@ func getVCPUs(instanceType string, vcpuMap map[string]int) int {
 	return 2
 }
 
-func calculateImpact(plan *TFPlan, region string, gridIntensity float64, embodiedData map[string]float64, vcpuMap map[string]int, x86Coeff, armCoeff UseCoeff) ([]ResourceImpact, float64, float64) {
+func calculateImpact(plan *TFPlan, region string, gridIntensity float64, embodiedData map[string]float64, vcpuMap map[string]int, x86Coeff, armCoeff UseCoeff, networkProfile string, lambdaInvocations int) ([]ResourceImpact, float64, float64) {
 	var totalDailyOps float64
 	var totalDailyEmb float64
 	var impacts []ResourceImpact
@@ -412,6 +442,8 @@ func calculateImpact(plan *TFPlan, region string, gridIntensity float64, embodie
 			var iType string
 			count := 1.0
 
+			var dbStorageGB float64
+
 			if res.Type == "aws_instance" {
 				if val, ok := res.Values["instance_type"].(string); ok {
 					iType = val
@@ -424,6 +456,9 @@ func calculateImpact(plan *TFPlan, region string, gridIntensity float64, embodie
 			} else if res.Type == "aws_db_instance" {
 				if val, ok := res.Values["instance_class"].(string); ok {
 					iType = strings.TrimPrefix(val, "db.")
+				}
+				if val, ok := res.Values["allocated_storage"].(float64); ok {
+					dbStorageGB = val
 				}
 			}
 
@@ -451,6 +486,30 @@ func calculateImpact(plan *TFPlan, region string, gridIntensity float64, embodie
 			dailyEmbPerInstance := embodiedTotal / LifespanDays
 			dailyEmb := dailyEmbPerInstance * count
 
+			// Add DB Storage overhead
+			if res.Type == "aws_db_instance" && dbStorageGB > 0 {
+				storageKwh := (0.0012 * dbStorageGB * 24.0 * PUE) / 1000.0
+				storageOps := (storageKwh * gridIntensity) / 1000.0
+				dailyOps += storageOps * count
+
+				storageEmb := (dbStorageGB / 1024.0) * 50.0 // 50kg per TB
+				dailyEmb += (storageEmb / LifespanDays) * count
+			}
+
+			// Add Networking overhead
+			if res.Type == "aws_instance" || res.Type == "aws_autoscaling_group" {
+				trafficGB := 100.0
+				if networkProfile == "low" {
+					trafficGB = 10.0
+				} else if networkProfile == "high" {
+					trafficGB = 1000.0
+				}
+				dailyGB := trafficGB / 30.0
+				netKwh := dailyGB * 0.001 * PUE
+				netOps := (netKwh * gridIntensity) / 1000.0
+				dailyOps += netOps * count
+			}
+
 			impacts = append(impacts, ResourceImpact{
 				Type:       res.Type,
 				Name:       res.Name,
@@ -463,6 +522,95 @@ func calculateImpact(plan *TFPlan, region string, gridIntensity float64, embodie
 
 			totalDailyOps += dailyOps
 			totalDailyEmb += dailyEmb
+		} else if res.Type == "aws_ebs_volume" {
+			var size float64
+			if val, ok := res.Values["size"].(float64); ok {
+				size = val
+			} else if val, ok := res.Values["size"].(int); ok {
+				size = float64(val)
+			}
+
+			var vType string
+			if val, ok := res.Values["type"].(string); ok {
+				vType = val
+			}
+
+			isSSD := vType == "gp2" || vType == "gp3" || vType == "io1" || vType == "io2" || vType == ""
+			wattsPerGB := 0.0065
+			embodiedPerTB := 20.0
+			if isSSD {
+				wattsPerGB = 0.0012
+				embodiedPerTB = 50.0
+			}
+
+			dailyKwh := (wattsPerGB * size * 24.0 * PUE) / 1000.0
+			dailyOps := (dailyKwh * gridIntensity) / 1000.0
+
+			embodiedTotal := (size / 1024.0) * embodiedPerTB
+			dailyEmb := embodiedTotal / LifespanDays
+
+			impacts = append(impacts, ResourceImpact{
+				Type:       res.Type,
+				Name:       res.Name,
+				Instance:   "Storage",
+				Count:      1,
+				DailyOps:   dailyOps,
+				DailyEmb:   dailyEmb,
+				TotalDaily: dailyOps + dailyEmb,
+			})
+
+			totalDailyOps += dailyOps
+			totalDailyEmb += dailyEmb
+		} else if res.Type == "aws_lb" || res.Type == "aws_alb" || res.Type == "aws_elb" {
+			trafficGB := 100.0
+			if networkProfile == "low" {
+				trafficGB = 10.0
+			} else if networkProfile == "high" {
+				trafficGB = 1000.0
+			}
+			dailyGB := trafficGB / 30.0
+			netKwh := dailyGB * 0.001 * PUE
+			dailyOps := (netKwh * gridIntensity) / 1000.0
+
+			impacts = append(impacts, ResourceImpact{
+				Type:       res.Type,
+				Name:       res.Name,
+				Instance:   "Network",
+				Count:      1,
+				DailyOps:   dailyOps,
+				DailyEmb:   0.0,
+				TotalDaily: dailyOps,
+			})
+
+			totalDailyOps += dailyOps
+		} else if res.Type == "aws_lambda_function" {
+			var memorySize float64 = 128.0
+			if val, ok := res.Values["memory_size"].(float64); ok {
+				memorySize = val
+			} else if val, ok := res.Values["memory_size"].(int); ok {
+				memorySize = float64(val)
+			}
+
+			avgDurationMs := 200.0
+			invocationsDay := float64(lambdaInvocations)
+
+			durationHours := (avgDurationMs * invocationsDay) / 3600000.0
+			wattage := x86Coeff.MinWatts
+
+			dailyKwh := ((memorySize / 1024.0) * durationHours * wattage * PUE) / 1000.0
+			dailyOps := (dailyKwh * gridIntensity) / 1000.0
+
+			impacts = append(impacts, ResourceImpact{
+				Type:       res.Type,
+				Name:       res.Name,
+				Instance:   "Serverless",
+				Count:      1,
+				DailyOps:   dailyOps,
+				DailyEmb:   0.0,
+				TotalDaily: dailyOps,
+			})
+
+			totalDailyOps += dailyOps
 		}
 	}
 	return impacts, totalDailyOps, totalDailyEmb
@@ -591,7 +739,44 @@ func main() {
 		tfInput = "." // default to current directory
 	}
 
-	fmt.Println("🌍 Carbon Optimizer - Static Infrastructure Carbon Estimator")
+	networkProfile := "medium"
+	lambdaInvocationsStr := "50000"
+
+	huh.NewForm(
+		huh.NewGroup(
+			huh.NewSelect[string]().
+				Title("Network Traffic Profile").
+				Options(
+					huh.NewOption("Low (10GB/mo)", "low"),
+					huh.NewOption("Medium (100GB/mo)", "medium"),
+					huh.NewOption("High (1TB/mo)", "high"),
+				).
+				Value(&networkProfile),
+			huh.NewInput().
+				Title("Lambda Daily Invocations (avg)").
+				Value(&lambdaInvocationsStr),
+		),
+	).Run()
+
+	lambdaInvocations, err := strconv.Atoi(lambdaInvocationsStr)
+	if err != nil {
+		lambdaInvocations = 50000
+	}
+
+	titleStyle := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("#FAFAFA")).
+		Background(lipgloss.Color("#00BF72")).
+		PaddingTop(1).
+		PaddingBottom(1).
+		PaddingLeft(4).
+		PaddingRight(4).
+		MarginBottom(1).
+		Border(lipgloss.DoubleBorder()).
+		BorderForeground(lipgloss.Color("#00BF72"))
+
+	fmt.Println(titleStyle.Render("🌍 Carbon Optimizer \nStatic Infrastructure Carbon Estimator Dashboard"))
+
 	fmt.Println("🔑 API Key configured for ElectricityMaps.")
 
 	fmt.Printf("📄 Analyzing Terraform Input: %s\n", tfInput)
@@ -686,7 +871,7 @@ func main() {
 	gridIntensity := getGridIntensity(emToken, region)
 	fmt.Printf("📍 Region identified: %s (Intensity: %.2f gCO2e/kWh)\n\n", region, gridIntensity)
 
-	impacts, totalDailyOps, totalDailyEmb := calculateImpact(&plan, region, gridIntensity, embodiedData, vcpuMap, x86Coeff, armCoeff)
+	impacts, totalDailyOps, totalDailyEmb := calculateImpact(&plan, region, gridIntensity, embodiedData, vcpuMap, x86Coeff, armCoeff, networkProfile, lambdaInvocations)
 
 	totalInstances := 0
 	var topResource ResourceImpact
@@ -700,10 +885,17 @@ func main() {
 		}
 	}
 
-	fmt.Println("📊 --- Granular Resource Carbon Impact Assessment ---")
-	fmt.Printf("%-25s %-25s %-12s %-6s %-10s %-10s %-10s\n", "Type", "Name", "Instance", "Qty", "Ops(kg)", "Emb(kg)", "Total(kg)")
-	fmt.Println(strings.Repeat("-", 103))
+	impactCols := []table.Column{
+		{Title: "Type", Width: 25},
+		{Title: "Name", Width: 25},
+		{Title: "Instance", Width: 15},
+		{Title: "Qty", Width: 6},
+		{Title: "Ops(kg)", Width: 10},
+		{Title: "Emb(kg)", Width: 10},
+		{Title: "Total(kg)", Width: 10},
+	}
 
+	var impactRows []table.Row
 	for _, imp := range impacts {
 		typeShort := imp.Type
 		if len(typeShort) > 23 {
@@ -714,21 +906,53 @@ func main() {
 			nameShort = nameShort[:20] + "..."
 		}
 
-		fmt.Printf("%-25s %-25s %-12s %-6d %-10.3f %-10.3f %-10.3f\n",
-			typeShort, nameShort, imp.Instance, imp.Count, imp.DailyOps, imp.DailyEmb, imp.TotalDaily)
+		impactRows = append(impactRows, table.Row{
+			typeShort,
+			nameShort,
+			imp.Instance,
+			fmt.Sprintf("%d", imp.Count),
+			fmt.Sprintf("%.3f", imp.DailyOps),
+			fmt.Sprintf("%.3f", imp.DailyEmb),
+			fmt.Sprintf("%.3f", imp.TotalDaily),
+		})
 	}
 
-	fmt.Println(strings.Repeat("-", 103))
 	originalTotal := totalDailyOps + totalDailyEmb
-	fmt.Printf("%-64s %-6d %-10.3f %-10.3f %-10.3f\n",
-		"TOTALS", totalInstances, totalDailyOps, totalDailyEmb, originalTotal)
+	impactRows = append(impactRows, table.Row{
+		"TOTALS",
+		"",
+		"",
+		fmt.Sprintf("%d", totalInstances),
+		fmt.Sprintf("%.3f", totalDailyOps),
+		fmt.Sprintf("%.3f", totalDailyEmb),
+		fmt.Sprintf("%.3f", originalTotal),
+	})
+
+	impactTable := table.New(
+		table.WithColumns(impactCols),
+		table.WithRows(impactRows),
+		table.WithHeight(len(impactRows)),
+	)
+
+	ts := table.DefaultStyles()
+	ts.Header = ts.Header.BorderStyle(lipgloss.NormalBorder()).BorderForeground(lipgloss.Color("240")).BorderBottom(true).Bold(true)
+	ts.Selected = ts.Selected.Foreground(lipgloss.Color("229")).Background(lipgloss.Color("57")).Bold(false)
+	impactTable.SetStyles(ts)
+
+	impactBox := lipgloss.NewStyle().
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("42")).
+		Padding(1, 2).
+		Render(fmt.Sprintf("📊 --- Granular Resource Carbon Impact Assessment ---\n\n%s", impactTable.View()))
+
+	fmt.Println(impactBox)
 
 	if highestDaily > 0 {
 		fmt.Printf("\n🔥 Top Emitter Detected: %s (%s) emitting %.3f kg CO2/day (Operations: %.3f kg, Embodied: %.3f kg, assuming a 4-year hardware lifespan).\n",
 			topResource.Name, topResource.Instance, highestDaily, topResource.DailyOps, topResource.DailyEmb)
 
 		fmt.Println("\n🌍 Discovering Regional Trade-off Matrix (same continent)...")
-		matrixContext := printRegionalMatrix(emToken, region, gridIntensity, totalDailyOps, plan, embodiedData, vcpuMap, x86Coeff, armCoeff)
+		matrixContext := printRegionalMatrix(emToken, region, gridIntensity, totalDailyOps, plan, embodiedData, vcpuMap, x86Coeff, armCoeff, networkProfile, lambdaInvocations)
 
 		aiSuggestion := getAISuggestions(openRouterToken, topResource, region, gridIntensity, matrixContext)
 
@@ -797,7 +1021,7 @@ func main() {
 		}
 
 		newGridIntensity := getGridIntensityQuiet(emToken, newRegion)
-		_, simOps, simEmb := calculateImpact(&simPlan, newRegion, newGridIntensity, embodiedData, vcpuMap, x86Coeff, armCoeff)
+		_, simOps, simEmb := calculateImpact(&simPlan, newRegion, newGridIntensity, embodiedData, vcpuMap, x86Coeff, armCoeff, networkProfile, lambdaInvocations)
 		simTotal := simOps + simEmb
 
 		fmt.Printf("\n📈 Projected Savings after Optimization:\n")
