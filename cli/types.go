@@ -1,7 +1,6 @@
 package main
 
 import (
-	"github.com/charmbracelet/bubbles/filepicker"
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -152,7 +151,7 @@ type model struct {
 	keyError    string
 
 	// File picker
-	fp           filepicker.Model
+	fp           customFilePicker
 	selectedPath string
 
 	// Loading spinner

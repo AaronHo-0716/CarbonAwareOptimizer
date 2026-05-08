@@ -127,26 +127,31 @@ func (m model) viewFilePicker() string {
 		"  Select a plan.json (pre-computed) or a project directory to run Terraform automatically",
 	)
 
+	// Current directory breadcrumb
+	cwdLine := dimStyle.Render("  📁 " + m.fp.currentDir)
+
 	errLine := ""
 	if m.errMsg != "" {
-		errLine = "\n" + redStyle.Render("  ⚠  "+m.errMsg)
+		errLine = "  " + redStyle.Render("⚠  "+m.errMsg)
 	}
 
+	// Reserve 2 extra rows for the breadcrumb + error lines
 	fpBox := unfocusedBorderStyle.
 		Width(m.width - 2).
-		Height(m.height - 6).
+		Height(m.height - 8).
 		Render(m.fp.View())
 
 	help := mutedStyle.Render(
-		"  ↑ ↓ · Navigate    Enter · Select / Open dir    q · Quit",
+		"  ↑ ↓ / j k · Navigate    Enter / → · Open    ← h Backspace · Go up    ~ · Home    q · Quit",
 	)
 
-	return lipgloss.JoinVertical(lipgloss.Left,
-		header,
-		subHeader+errLine,
-		fpBox,
-		help,
-	)
+	lines := []string{header, subHeader, cwdLine}
+	if errLine != "" {
+		lines = append(lines, errLine)
+	}
+	lines = append(lines, fpBox, help)
+
+	return lipgloss.JoinVertical(lipgloss.Left, lines...)
 }
 
 // ── Loading view ──────────────────────────────────────────────────────────────
@@ -354,19 +359,22 @@ func (m model) buildMainContent() string {
 // ── Impact table ──────────────────────────────────────────────────────────────
 
 func (m model) buildImpactTable() string {
-	// Available inner content width: viewport width minus table border (2) and padding (2)
-	avail := m.vpWidth() - 4
-	if avail < 60 {
-		avail = 60
+	// table.DefaultStyles() gives every cell Padding(0,1). In lipgloss, Width()
+	// sets the *content* area (excl. padding), so each column renders col_width+2
+	// chars at runtime. We must subtract that from the available space or the
+	// table overflows the viewport.
+	// Overhead: box border(2) + box padding(2) + 7 cols × cell padding(2) = 18
+	const overhead = 2 + 2 + 7*2 // = 18
+	avail := m.vpWidth() - overhead
+	if avail < 50 {
+		avail = 50
 	}
 
-	// Fixed-width columns
 	instW, qtyW, opsW, embW, totW := 12, 5, 9, 9, 10
 	fixed := instW + qtyW + opsW + embW + totW // 45
-	// Remaining space split between Type and Name
-	dyn := avail - fixed - 5 // 5 for column separators
-	if dyn < 20 {
-		dyn = 20
+	dyn := avail - fixed
+	if dyn < 16 {
+		dyn = 16
 	}
 	typeW := dyn / 2
 	nameW := dyn - typeW
@@ -429,16 +437,18 @@ func (m model) buildMatrixTable() string {
 		return mutedStyle.Render("  (regional matrix unavailable — check your ElectricityMaps token)")
 	}
 
-	avail := m.vpWidth() - 4
-	if avail < 50 {
-		avail = 50
+	// Overhead: box border(2) + box padding(2) + 4 cols × cell padding(2) = 12
+	const overhead = 2 + 2 + 4*2 // = 12
+	avail := m.vpWidth() - overhead
+	if avail < 45 {
+		avail = 45
 	}
 
 	intW, totW, deltaW := 18, 13, 12
 	fixed := intW + totW + deltaW // 43
-	regionW := avail - fixed - 4  // 4 for separators
-	if regionW < 20 {
-		regionW = 20
+	regionW := avail - fixed
+	if regionW < 18 {
+		regionW = 18
 	}
 
 	cols := []table.Column{

@@ -5,7 +5,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/charmbracelet/bubbles/filepicker"
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -57,12 +56,7 @@ func initialModel() model {
 
 	// File picker — start in cwd
 	wd, _ := os.Getwd()
-	fp := filepicker.New()
-	fp.AllowedTypes = []string{".json"}
-	fp.DirAllowed = true
-	fp.ShowPermissions = false
-	fp.ShowSize = true
-	fp.CurrentDirectory = wd
+	fp := newFilePicker(wd)
 
 	initState := stateFilePicker
 	if emToken == "" {
@@ -137,7 +131,8 @@ func saveEnv(emToken, orToken string) {
 // ── Init ──────────────────────────────────────────────────────────────────────
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(m.fp.Init(), textinput.Blink)
+	// customFilePicker loads synchronously; only text-input blink needed.
+	return textinput.Blink
 }
 
 // ── Update ────────────────────────────────────────────────────────────────────
@@ -149,7 +144,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		m.fp.Height = m.height - 9
+		m.fp.height = m.height - 10
 		if m.mainVPReady {
 			m.mainVP.Width = m.vpWidth()
 			m.mainVP.Height = m.vpHeight()
@@ -166,8 +161,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case stateAPIKeys:
 			return m.updateAPIKeys(msg)
 		case stateFilePicker:
-			if msg.String() == "q" {
+			switch msg.String() {
+			case "q":
 				return m, tea.Quit
+			case "~":
+				if home, err := os.UserHomeDir(); err == nil {
+					m.fp.navigateTo(home)
+				}
+				return m, nil
+			default:
+				path, didSelect := m.fp.update(msg.String())
+				if didSelect {
+					m.selectedPath = path
+					m.errMsg = ""
+					m.state = stateLoading
+					m.loadMsg = "Analysing your infrastructure…"
+					return m, tea.Batch(
+						m.spinner.Tick,
+						runAnalysisCmd(path, m.emToken, m.embodiedData, m.vcpuMap,
+							m.x86Coeff, m.armCoeff, m.networkProfile, m.lambdaInvocations),
+					)
+				}
+				return m, nil
 			}
 		case stateLoading:
 			return m, nil // absorb all keys while busy
@@ -250,25 +265,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// ── File-picker: always forward messages when active ──────────────────────
-	if m.state == stateFilePicker {
-		var cmd tea.Cmd
-		m.fp, cmd = m.fp.Update(msg)
-
-		if didSelect, path := m.fp.DidSelectFile(msg); didSelect {
-			m.selectedPath = path
-			m.errMsg = ""
-			m.state = stateLoading
-			m.loadMsg = "Analysing your infrastructure…"
-			return m, tea.Batch(
-				m.spinner.Tick,
-				runAnalysisCmd(path, m.emToken, m.embodiedData, m.vcpuMap,
-					m.x86Coeff, m.armCoeff, m.networkProfile, m.lambdaInvocations),
-			)
-		}
-		return m, cmd
-	}
-
 	// ── Viewport scroll when main panel is focused ────────────────────────────
 	if m.state == stateResults && m.focus == focusMain && m.mainVPReady {
 		var cmd tea.Cmd
@@ -308,7 +304,7 @@ func (m model) updateAPIKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		saveEnv(m.emToken, m.orToken)
 		m.state = stateFilePicker
 		m.keyError = ""
-		return m, m.fp.Init()
+		return m, nil
 	}
 
 	// Forward keystrokes to the focused text input
@@ -343,7 +339,7 @@ func (m model) updateResults(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.mainVPReady = false
 		m.simDone = false
 		m.errMsg = ""
-		return m, m.fp.Init()
+		return m, nil
 	}
 
 	if m.focus == focusSide {

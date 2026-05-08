@@ -83,23 +83,30 @@ func loadPlan(path string) (TFPlan, error) {
 	var planData []byte
 
 	if !info.IsDir() && strings.HasSuffix(path, ".json") {
-		// Pre-computed JSON plan
+		// Pre-computed JSON plan — read directly.
 		planData, err = os.ReadFile(path)
 		if err != nil {
 			return TFPlan{}, fmt.Errorf("reading plan file: %w", err)
 		}
 	} else {
-		// Directory — run terraform init / plan / show
+		// Directory or .tf file — run terraform init / plan / show.
 		dir := path
 		if !info.IsDir() {
-			dir = filepath.Dir(path)
+			dir = filepath.Dir(path) // .tf file: use its directory
 		}
 		if _, err := exec.LookPath("terraform"); err != nil {
 			return TFPlan{}, fmt.Errorf("terraform CLI not found — provide a plan.json instead")
 		}
 
+		// Build the environment: inherit current env, ensure AWS_PROFILE is set.
+		tfEnv := os.Environ()
+		if os.Getenv("AWS_PROFILE") == "" {
+			tfEnv = append(tfEnv, "AWS_PROFILE=lifeng")
+		}
+
 		initCmd := exec.Command("terraform", "init")
 		initCmd.Dir = dir
+		initCmd.Env = tfEnv
 		if out, err := initCmd.CombinedOutput(); err != nil {
 			return TFPlan{}, fmt.Errorf("terraform init failed:\n%s", string(out))
 		}
@@ -107,6 +114,7 @@ func loadPlan(path string) (TFPlan, error) {
 		planFile := ".carbon_plan.tfplan"
 		planCmd := exec.Command("terraform", "plan", "-out="+planFile)
 		planCmd.Dir = dir
+		planCmd.Env = tfEnv
 		if out, err := planCmd.CombinedOutput(); err != nil {
 			return TFPlan{}, fmt.Errorf("terraform plan failed:\n%s", string(out))
 		}
@@ -114,6 +122,7 @@ func loadPlan(path string) (TFPlan, error) {
 
 		showCmd := exec.Command("terraform", "show", "-json", planFile)
 		showCmd.Dir = dir
+		showCmd.Env = tfEnv
 		planData, err = showCmd.Output()
 		if err != nil {
 			return TFPlan{}, fmt.Errorf("terraform show failed: %w", err)
