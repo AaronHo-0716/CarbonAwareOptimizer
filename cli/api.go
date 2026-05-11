@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +40,171 @@ func getGridIntensityQuiet(token, region string) float64 {
 		return 250.0
 	}
 	return r.CarbonIntensity
+}
+
+func getGridIntensitySeriesQuiet(token, region string, start, end time.Time) []CarbonIntensityPoint {
+	if !end.After(start) {
+		end = start.Add(24 * time.Hour)
+	}
+	client := &http.Client{Timeout: 10 * time.Second}
+	u, _ := url.Parse("https://api.electricitymaps.com/v3/carbon-intensity/past-range")
+	q := u.Query()
+	q.Set("dataCenterProvider", "aws")
+	q.Set("dataCenterRegion", region)
+	q.Set("start", start.UTC().Format(time.RFC3339Nano))
+	q.Set("end", end.UTC().Format(time.RFC3339Nano))
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequest("GET", u.String(), nil)
+	if err != nil {
+		return []CarbonIntensityPoint{{Timestamp: end.UTC(), Intensity: getGridIntensityQuiet(token, region)}}
+	}
+	req.Header.Set("auth-token", token)
+
+	resp, err := client.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		return []CarbonIntensityPoint{{Timestamp: end.UTC(), Intensity: getGridIntensityQuiet(token, region)}}
+	}
+	defer resp.Body.Close()
+
+	var payload interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return []CarbonIntensityPoint{{Timestamp: end.UTC(), Intensity: getGridIntensityQuiet(token, region)}}
+	}
+	points := parseIntensityPoints(payload)
+	if len(points) == 0 {
+		return []CarbonIntensityPoint{{Timestamp: end.UTC(), Intensity: getGridIntensityQuiet(token, region)}}
+	}
+	return points
+}
+
+func parseIntensityPoints(payload interface{}) []CarbonIntensityPoint {
+	var points []CarbonIntensityPoint
+	appendPoint := func(ts time.Time, intensity float64) {
+		if intensity <= 0 || ts.IsZero() {
+			return
+		}
+		points = append(points, CarbonIntensityPoint{
+			Timestamp: ts.UTC(),
+			Intensity: intensity,
+		})
+	}
+
+	parsePoint := func(item map[string]interface{}) {
+		intensity := extractNumber(item["carbonIntensity"])
+		if intensity <= 0 {
+			intensity = extractNumber(item["intensity"])
+		}
+		ts := extractTimestamp(item)
+		appendPoint(ts, intensity)
+	}
+	var walk func(node interface{})
+	walk = func(node interface{}) {
+		switch v := node.(type) {
+		case []interface{}:
+			for _, item := range v {
+				walk(item)
+			}
+		case map[string]interface{}:
+			parsePoint(v)
+			for key, val := range v {
+				// Handles shapes like {"history":{"2026-...Z":123.4}}.
+				if maybeTS, err := time.Parse(time.RFC3339Nano, key); err == nil {
+					appendPoint(maybeTS, extractNumber(val))
+				}
+				walk(val)
+			}
+		}
+	}
+	walk(payload)
+	sort.Slice(points, func(i, j int) bool {
+		return points[i].Timestamp.Before(points[j].Timestamp)
+	})
+	dedup := make([]CarbonIntensityPoint, 0, len(points))
+	for _, p := range points {
+		if len(dedup) > 0 && dedup[len(dedup)-1].Timestamp.Equal(p.Timestamp) {
+			dedup[len(dedup)-1] = p
+			continue
+		}
+		dedup = append(dedup, p)
+	}
+	return dedup
+}
+
+func extractNumber(v interface{}) float64 {
+	switch n := v.(type) {
+	case float64:
+		return n
+	case int:
+		return float64(n)
+	case int64:
+		return float64(n)
+	case json.Number:
+		f, _ := n.Float64()
+		return f
+	case string:
+		f, _ := strconv.ParseFloat(strings.TrimSpace(n), 64)
+		return f
+	default:
+		return 0
+	}
+}
+
+func extractTimestamp(m map[string]interface{}) time.Time {
+	for _, key := range []string{"datetime", "timestamp", "createdAt", "created_at", "time"} {
+		if raw, ok := m[key]; ok {
+			switch t := raw.(type) {
+			case string:
+				for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02T15:04:05.000Z"} {
+					if parsed, err := time.Parse(layout, t); err == nil {
+						return parsed
+					}
+				}
+			case float64:
+				if t > 1e12 {
+					return time.UnixMilli(int64(t))
+				}
+				return time.Unix(int64(t), 0)
+			case int64:
+				if t > 1e12 {
+					return time.UnixMilli(t)
+				}
+				return time.Unix(t, 0)
+			}
+		}
+	}
+	return time.Time{}
+}
+
+func weightedAverageIntensity(points []CarbonIntensityPoint) float64 {
+	if len(points) == 0 {
+		return 250.0
+	}
+	if len(points) == 1 {
+		return points[0].Intensity
+	}
+	var weightedSum float64
+	var totalHours float64
+	for i := range points {
+		start := points[i].Timestamp
+		end := start.Add(1 * time.Hour)
+		if i < len(points)-1 {
+			end = points[i+1].Timestamp
+		}
+		hours := end.Sub(start).Hours()
+		if hours <= 0 {
+			continue
+		}
+		weightedSum += points[i].Intensity * hours
+		totalHours += hours
+	}
+	if totalHours <= 0 {
+		return points[len(points)-1].Intensity
+	}
+	return weightedSum / totalHours
 }
 
 // ── Regional matrix ───────────────────────────────────────────────────────────

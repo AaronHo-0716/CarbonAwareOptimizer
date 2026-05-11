@@ -1,6 +1,8 @@
 package main
 
 import (
+	"time"
+
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -30,6 +32,14 @@ type TFPlan struct {
 				ConstantValue string `json:"constant_value"`
 			} `json:"expressions"`
 		} `json:"provider_config"`
+		RootModule struct {
+			Resources []struct {
+				Address     string                 `json:"address"`
+				Type        string                 `json:"type"`
+				Name        string                 `json:"name"`
+				Expressions map[string]interface{} `json:"expressions"`
+			} `json:"resources"`
+		} `json:"root_module"`
 	} `json:"configuration"`
 }
 
@@ -62,6 +72,16 @@ type CarbonIntensityResponse struct {
 type RegionIntensity struct {
 	Region    string
 	Intensity float64
+}
+
+type CarbonIntensityPoint struct {
+	Timestamp time.Time
+	Intensity float64
+}
+
+type OpsEmissionPoint struct {
+	Timestamp time.Time
+	Emissions float64
 }
 
 type AIRequest struct {
@@ -154,6 +174,9 @@ type analysisCompleteMsg struct {
 	plan          TFPlan
 	region        string
 	intensity     float64
+	intensityData []CarbonIntensityPoint
+	opsSeries     []OpsEmissionPoint
+	skipAIFetch   bool
 	impacts       []ResourceImpact
 	topResource   ResourceImpact
 	totalOps      float64
@@ -189,6 +212,7 @@ type model struct {
 	// File picker
 	fp           customFilePicker
 	selectedPath string
+	cachedPlan   *TFPlan
 
 	// Loading spinner
 	spinner spinner.Model
@@ -204,6 +228,8 @@ type model struct {
 	plan          TFPlan
 	region        string
 	gridIntensity float64
+	intensityData []CarbonIntensityPoint
+	opsSeries     []OpsEmissionPoint
 	impacts       []ResourceImpact
 	topResource   ResourceImpact
 	totalOps      float64
@@ -242,6 +268,7 @@ type model struct {
 	sideFocused       sideItem // currently focused side-panel element
 	optType           string   // "graviton" | "region"
 	regionInput       textinput.Model
+	intensityCache    map[string][]CarbonIntensityPoint
 
 	// Simulation result (after clicking Apply)
 	simOps   float64

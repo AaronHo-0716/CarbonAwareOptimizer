@@ -4,6 +4,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -48,22 +49,22 @@ func initialModel() model {
 	lambdaIn.Width = sideW - 6
 
 	workStartIn := textinput.New()
-	workStartIn.SetValue("0")
+	workStartIn.SetValue("9")
 	workStartIn.CharLimit = 2
 	workStartIn.Width = sideW - 6
 
 	workEndIn := textinput.New()
-	workEndIn.SetValue("24")
+	workEndIn.SetValue("17")
 	workEndIn.CharLimit = 2
 	workEndIn.Width = sideW - 6
 
 	workUtilIn := textinput.New()
-	workUtilIn.SetValue("50")
+	workUtilIn.SetValue("75")
 	workUtilIn.CharLimit = 3
 	workUtilIn.Width = sideW - 6
 
 	idleUtilIn := textinput.New()
-	idleUtilIn.SetValue("50")
+	idleUtilIn.SetValue("1")
 	idleUtilIn.CharLimit = 3
 	idleUtilIn.Width = sideW - 6
 
@@ -120,10 +121,11 @@ func initialModel() model {
 		workEndInput:      workEndIn,
 		workUtilInput:     workUtilIn,
 		idleUtilInput:     idleUtilIn,
-		utilization:       normalizeSchedule(UtilizationSchedule{WorkStartHour: 0, WorkEndHour: 24, WorkPct: 50, IdlePct: 50}),
+		utilization:       normalizeSchedule(UtilizationSchedule{WorkStartHour: 9, WorkEndHour: 17, WorkPct: 75, IdlePct: 1}),
 		optType:           "graviton",
 		regionInput:       regionIn,
 		sideFocused:       sideOptGraviton,
+		intensityCache:    make(map[string][]CarbonIntensityPoint),
 
 		focus: focusMain,
 	}
@@ -201,13 +203,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				path, didSelect := m.fp.update(msg.String())
 				if didSelect {
 					m.selectedPath = path
+					m.cachedPlan = nil
 					m.errMsg = ""
 					m.state = stateLoading
 					m.loadMsg = "Analysing your infrastructure…"
 					return m, tea.Batch(
 						m.spinner.Tick,
 						runAnalysisCmd(path, m.emToken, m.embodiedData, m.vcpuMap,
-							m.x86Coeff, m.armCoeff, m.networkProfile, m.lambdaInvocations, m.utilization),
+							m.x86Coeff, m.armCoeff, m.networkProfile, m.lambdaInvocations, m.utilization, m.cachedPlan, m.intensityCache),
 					)
 				}
 				return m, nil
@@ -230,8 +233,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// ── Analysis complete ─────────────────────────────────────────────────────
 	case analysisCompleteMsg:
 		m.plan = msg.plan
+		cp := msg.plan
+		m.cachedPlan = &cp
 		m.region = msg.region
 		m.gridIntensity = msg.intensity
+		m.intensityData = msg.intensityData
+		m.opsSeries = msg.opsSeries
 		m.impacts = msg.impacts
 		m.topResource = msg.topResource
 		m.totalOps = msg.totalOps
@@ -245,8 +252,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.baselineWarn = msg.pricingWarn
 		m.pricingWarn = msg.pricingWarn
 		m.simDone = false
-		m.aiContent = ""
-		m.aiLoading = true
+		if !msg.skipAIFetch {
+			m.aiContent = ""
+			m.aiLoading = true
+		}
 		m.state = stateResults
 
 		// Keep latest side-panel settings so the displayed assumptions match analysis.
@@ -265,6 +274,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.mainVP = vp
 		m.mainVPReady = true
 
+		if msg.skipAIFetch {
+			m.aiLoading = false
+			return m, nil
+		}
 		return m, fetchAICmd(m.orToken, msg.topResource, msg.region, msg.intensity, msg.matrixContext)
 
 	// ── AI result ────────────────────────────────────────────────────────────
@@ -625,11 +638,19 @@ func (m model) triggerReanalysis() (model, tea.Cmd) {
 	m.loadMsg = "Re-analysing with updated settings…"
 	m.mainVPReady = false
 	m.simDone = false
-	m.aiContent = ""
+	if m.cachedPlan == nil {
+		return m, tea.Batch(
+			m.spinner.Tick,
+			runAnalysisCmd(m.selectedPath, m.emToken, m.embodiedData, m.vcpuMap,
+				m.x86Coeff, m.armCoeff, m.networkProfile, m.lambdaInvocations, m.utilization, m.cachedPlan, m.intensityCache),
+		)
+	}
 	return m, tea.Batch(
 		m.spinner.Tick,
-		runAnalysisCmd(m.selectedPath, m.emToken, m.embodiedData, m.vcpuMap,
-			m.x86Coeff, m.armCoeff, m.networkProfile, m.lambdaInvocations, m.utilization),
+		runReanalysisCmd(
+			*m.cachedPlan, m.region, m.intensityData, m.matrixData, m.emToken,
+			m.embodiedData, m.vcpuMap, m.x86Coeff, m.armCoeff, m.networkProfile, m.lambdaInvocations, m.utilization,
+		),
 	)
 }
 
@@ -650,8 +671,8 @@ func (m model) applyOptimization() (model, tea.Cmd) {
 	if m.optType == "graviton" {
 		// Pure local computation — no HTTP needed
 		simPlan := simulateGraviton(m.plan)
-		_, simOps, simEmb := calculateImpact(
-			&simPlan, m.region, m.gridIntensity,
+		_, simOps, simEmb, _ := calculateImpactWithSeries(
+			&simPlan, m.region, m.intensityData,
 			m.embodiedData, m.vcpuMap, m.x86Coeff, m.armCoeff,
 			m.networkProfile, m.lambdaInvocations, m.utilization,
 		)
@@ -676,7 +697,7 @@ func (m model) applyOptimization() (model, tea.Cmd) {
 	return m, runRegionSimCmd(
 		newRegion, m.emToken, m.plan,
 		m.embodiedData, m.vcpuMap, m.x86Coeff, m.armCoeff,
-		m.networkProfile, m.lambdaInvocations, m.utilization,
+		m.networkProfile, m.lambdaInvocations, m.utilization, m.intensityCache,
 	)
 }
 
@@ -742,16 +763,33 @@ func runAnalysisCmd(
 	x86, arm UseCoeff,
 	networkProfile string, lambdaInv int,
 	schedule UtilizationSchedule,
+	cachedPlan *TFPlan,
+	intensityCache map[string][]CarbonIntensityPoint,
 ) tea.Cmd {
 	return func() tea.Msg {
-		plan, err := loadPlan(path)
-		if err != nil {
-			return errMsg{err}
+		var plan TFPlan
+		if cachedPlan != nil {
+			plan = *cachedPlan
+		} else {
+			loaded, err := loadPlan(path)
+			if err != nil {
+				return errMsg{err}
+			}
+			plan = loaded
 		}
 		region := extractRegion(plan)
-		intensity := getGridIntensityQuiet(emToken, region)
-		impacts, totalOps, totalEmb := calculateImpact(
-			&plan, region, intensity, embodied, vcpuMap, x86, arm, networkProfile, lambdaInv, schedule,
+		intensityData := intensityCache[region]
+		if len(intensityData) == 0 {
+			end := time.Now().UTC()
+			start := end.Add(-24 * time.Hour)
+			intensityData = getGridIntensitySeriesQuiet(emToken, region, start, end)
+			if len(intensityData) > 0 {
+				intensityCache[region] = intensityData
+			}
+		}
+		intensity := weightedAverageIntensity(intensityData)
+		impacts, totalOps, totalEmb, opsSeries := calculateImpactWithSeries(
+			&plan, region, intensityData, embodied, vcpuMap, x86, arm, networkProfile, lambdaInv, schedule,
 		)
 		baselineCost, pricingWarn := buildCostSummary(&plan, region, lambdaInv)
 
@@ -774,6 +812,8 @@ func runAnalysisCmd(
 			plan:          plan,
 			region:        region,
 			intensity:     intensity,
+			intensityData: intensityData,
+			opsSeries:     opsSeries,
 			impacts:       impacts,
 			topResource:   topResource,
 			totalOps:      totalOps,
@@ -781,6 +821,85 @@ func runAnalysisCmd(
 			hasNetworkRes: hasNetwork,
 			hasLambdaRes:  hasLambda,
 			matrixData:    matrixData,
+			matrixContext: matrixCtx,
+			baselineCost:  baselineCost,
+			pricingWarn:   pricingWarn,
+		}
+	}
+}
+
+func runReanalysisCmd(
+	plan TFPlan,
+	region string,
+	intensityData []CarbonIntensityPoint,
+	matrixData []MatrixRow,
+	emToken string,
+	embodied map[string]float64, vcpuMap map[string]int,
+	x86, arm UseCoeff,
+	networkProfile string, lambdaInv int,
+	schedule UtilizationSchedule,
+) tea.Cmd {
+	return func() tea.Msg {
+		if len(intensityData) == 0 {
+			end := time.Now().UTC()
+			start := end.Add(-24 * time.Hour)
+			intensityData = getGridIntensitySeriesQuiet(emToken, region, start, end)
+		}
+		intensity := weightedAverageIntensity(intensityData)
+		impacts, totalOps, totalEmb, opsSeries := calculateImpactWithSeries(
+			&plan, region, intensityData, embodied, vcpuMap, x86, arm, networkProfile, lambdaInv, schedule,
+		)
+		baselineCost, pricingWarn := buildCostSummary(&plan, region, lambdaInv)
+
+		var topResource ResourceImpact
+		highest := -1.0
+		for _, imp := range impacts {
+			if imp.TotalDaily > highest {
+				highest = imp.TotalDaily
+				topResource = imp
+			}
+		}
+
+		updatedMatrix := make([]MatrixRow, 0, len(matrixData))
+		for _, row := range matrixData {
+			targetRegion := strings.Fields(row.RegionName)[0]
+			_, simOps, simEmb := calculateImpact(
+				&plan, targetRegion, row.Intensity, embodied, vcpuMap, x86, arm, networkProfile, lambdaInv, schedule,
+			)
+			costSummary, _ := buildCostSummary(&plan, targetRegion, lambdaInv)
+			deltaStr := "—"
+			if targetRegion != region && totalOps > 0 {
+				pct := ((simOps - totalOps) / totalOps) * 100
+				if pct >= 0 {
+					deltaStr = "+" + strconv.FormatFloat(pct, 'f', 1, 64) + "%"
+				} else {
+					deltaStr = strconv.FormatFloat(pct, 'f', 1, 64) + "%"
+				}
+			}
+			row.Total = simOps + simEmb
+			row.DeltaStr = deltaStr
+			row.HourlyCost = costSummary.TotalHourly
+			row.MonthlyCost = costSummary.TotalMonthly
+			row.CostKnown = len(costSummary.Resources) > 0 && costSummary.UnavailableCount < len(costSummary.Resources)
+			updatedMatrix = append(updatedMatrix, row)
+		}
+		matrixCtx := "Live Regional Trade-off Matrix:\n(recomputed from cached intensity and current side-panel settings)\n"
+
+		hasNetwork, hasLambda := detectResourceTypes(plan)
+		return analysisCompleteMsg{
+			plan:          plan,
+			region:        region,
+			intensity:     intensity,
+			intensityData: intensityData,
+			opsSeries:     opsSeries,
+			skipAIFetch:   true,
+			impacts:       impacts,
+			topResource:   topResource,
+			totalOps:      totalOps,
+			totalEmb:      totalEmb,
+			hasNetworkRes: hasNetwork,
+			hasLambdaRes:  hasLambda,
+			matrixData:    updatedMatrix,
 			matrixContext: matrixCtx,
 			baselineCost:  baselineCost,
 			pricingWarn:   pricingWarn,
@@ -806,11 +925,20 @@ func runRegionSimCmd(
 	x86, arm UseCoeff,
 	networkProfile string, lambdaInv int,
 	schedule UtilizationSchedule,
+	intensityCache map[string][]CarbonIntensityPoint,
 ) tea.Cmd {
 	return func() tea.Msg {
-		intensity := getGridIntensityQuiet(emToken, newRegion)
-		_, simOps, simEmb := calculateImpact(
-			&plan, newRegion, intensity, embodied, vcpuMap, x86, arm, networkProfile, lambdaInv, schedule,
+		intensityData := intensityCache[newRegion]
+		if len(intensityData) == 0 {
+			end := time.Now().UTC()
+			start := end.Add(-24 * time.Hour)
+			intensityData = getGridIntensitySeriesQuiet(emToken, newRegion, start, end)
+			if len(intensityData) > 0 {
+				intensityCache[newRegion] = intensityData
+			}
+		}
+		_, simOps, simEmb, _ := calculateImpactWithSeries(
+			&plan, newRegion, intensityData, embodied, vcpuMap, x86, arm, networkProfile, lambdaInv, schedule,
 		)
 		targetCost, pricingWarn := buildCostSummary(&plan, newRegion, lambdaInv)
 		return simCompleteMsg{

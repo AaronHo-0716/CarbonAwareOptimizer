@@ -7,8 +7,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // ── Region lookup tables ──────────────────────────────────────────────────────
@@ -413,6 +415,272 @@ func calculateImpact(
 		}
 	}
 	return impacts, totalOps, totalEmb
+}
+
+func calculateImpactWithSeries(
+	plan *TFPlan,
+	region string,
+	intensityData []CarbonIntensityPoint,
+	embodiedData map[string]float64, vcpuMap map[string]int,
+	x86Coeff, armCoeff UseCoeff,
+	networkProfile string, lambdaInvocations int,
+	schedule UtilizationSchedule,
+) ([]ResourceImpact, float64, float64, []OpsEmissionPoint) {
+	const PUE = 1.135
+	const LifespanDays = 1460.0
+
+	points := normalizeIntensityData(intensityData)
+	if len(points) == 0 {
+		impacts, totalOps, totalEmb := calculateImpact(
+			plan, region, 250.0, embodiedData, vcpuMap, x86Coeff, armCoeff, networkProfile, lambdaInvocations, schedule,
+		)
+		return impacts, totalOps, totalEmb, nil
+	}
+
+	opsByTimestamp := make(map[time.Time]float64)
+	addSeriesOps := func(ts time.Time, ops float64) {
+		if ops <= 0 {
+			return
+		}
+		opsByTimestamp[ts] += ops
+	}
+
+	var totalOps, totalEmb float64
+	var impacts []ResourceImpact
+
+	for _, res := range plan.PlannedValues.RootModule.Resources {
+		if res.Mode != "managed" {
+			continue
+		}
+
+		switch res.Type {
+		case "aws_instance", "aws_autoscaling_group", "aws_db_instance":
+			var iType string
+			count := 1.0
+			var dbStorageGB float64
+
+			switch res.Type {
+			case "aws_instance":
+				iType, _ = res.Values["instance_type"].(string)
+			case "aws_autoscaling_group":
+				if v, ok := res.Values["desired_capacity"].(float64); ok {
+					count = v
+				}
+				iType = "t3.medium"
+			case "aws_db_instance":
+				if v, ok := res.Values["instance_class"].(string); ok {
+					iType = strings.TrimPrefix(v, "db.")
+				}
+				if v, ok := res.Values["allocated_storage"].(float64); ok {
+					dbStorageGB = v
+				}
+			}
+			if iType == "" {
+				iType = "m5.large"
+			}
+
+			vcpus := float64(getVCPUs(iType, vcpuMap))
+			coeff := x86Coeff
+			if strings.Contains(iType, "r7g") || strings.HasSuffix(strings.Split(iType, ".")[0], "g") {
+				coeff = armCoeff
+			}
+
+			var dailyOps float64
+			for i, p := range points {
+				hours := seriesIntervalHours(points, i)
+				if hours <= 0 {
+					continue
+				}
+				utilization := utilizationAtTime(schedule, p.Timestamp)
+				avgW := coeff.MinWatts + (coeff.MaxWatts-coeff.MinWatts)*utilization
+				kwh := (avgW * vcpus * hours * PUE) / 1000.0
+				opsKg := (kwh * p.Intensity / 1000.0) * count
+				dailyOps += opsKg
+				addSeriesOps(p.Timestamp, opsKg)
+
+				if res.Type == "aws_db_instance" && dbStorageGB > 0 {
+					sKwh := (0.0012 * dbStorageGB * hours * PUE) / 1000.0
+					sOps := (sKwh * p.Intensity / 1000.0) * count
+					dailyOps += sOps
+					addSeriesOps(p.Timestamp, sOps)
+				}
+
+				if res.Type == "aws_instance" || res.Type == "aws_autoscaling_group" {
+					trafficGB := (trafficByProfile(networkProfile) / 30.0 / 24.0) * hours
+					netKwh := trafficGB * 0.001 * PUE
+					netOps := (netKwh * p.Intensity / 1000.0) * count
+					dailyOps += netOps
+					addSeriesOps(p.Timestamp, netOps)
+				}
+			}
+
+			emb := embodiedData[iType]
+			if emb == 0 {
+				emb = 1200.0
+			}
+			dailyEmb := (emb / LifespanDays) * count
+			if res.Type == "aws_db_instance" && dbStorageGB > 0 {
+				dailyEmb += ((dbStorageGB / 1024.0) * 50.0 / LifespanDays) * count
+			}
+
+			impacts = append(impacts, ResourceImpact{
+				Type: res.Type, Name: res.Name, Instance: iType,
+				Count: int(count), DailyOps: dailyOps, DailyEmb: dailyEmb, TotalDaily: dailyOps + dailyEmb,
+			})
+			totalOps += dailyOps
+			totalEmb += dailyEmb
+
+		case "aws_ebs_volume":
+			var size float64
+			if v, ok := res.Values["size"].(float64); ok {
+				size = v
+			}
+			vType, _ := res.Values["type"].(string)
+			isSSD := vType == "gp2" || vType == "gp3" || vType == "io1" || vType == "io2" || vType == ""
+			wPerGB, embPerTB := 0.0065, 20.0
+			if isSSD {
+				wPerGB, embPerTB = 0.0012, 50.0
+			}
+
+			var dailyOps float64
+			for i, p := range points {
+				hours := seriesIntervalHours(points, i)
+				if hours <= 0 {
+					continue
+				}
+				kwh := (wPerGB * size * hours * PUE) / 1000.0
+				opsKg := (kwh * p.Intensity) / 1000.0
+				dailyOps += opsKg
+				addSeriesOps(p.Timestamp, opsKg)
+			}
+			dailyEmb := (size / 1024.0) * embPerTB / LifespanDays
+
+			impacts = append(impacts, ResourceImpact{
+				Type: res.Type, Name: res.Name, Instance: "Storage",
+				Count: 1, DailyOps: dailyOps, DailyEmb: dailyEmb, TotalDaily: dailyOps + dailyEmb,
+			})
+			totalOps += dailyOps
+			totalEmb += dailyEmb
+
+		case "aws_lb", "aws_alb", "aws_elb":
+			var dailyOps float64
+			for i, p := range points {
+				hours := seriesIntervalHours(points, i)
+				if hours <= 0 {
+					continue
+				}
+				trafficGB := (trafficByProfile(networkProfile) / 30.0 / 24.0) * hours
+				netKwh := trafficGB * 0.001 * PUE
+				opsKg := (netKwh * p.Intensity) / 1000.0
+				dailyOps += opsKg
+				addSeriesOps(p.Timestamp, opsKg)
+			}
+
+			impacts = append(impacts, ResourceImpact{
+				Type: res.Type, Name: res.Name, Instance: "Network",
+				Count: 1, DailyOps: dailyOps, DailyEmb: 0, TotalDaily: dailyOps,
+			})
+			totalOps += dailyOps
+
+		case "aws_lambda_function":
+			mem := 128.0
+			if v, ok := res.Values["memory_size"].(float64); ok {
+				mem = v
+			}
+			inv := float64(lambdaInvocations)
+			dayDurHours := (200.0 * inv) / 3_600_000.0
+
+			var dailyOps float64
+			for i, p := range points {
+				hours := seriesIntervalHours(points, i)
+				if hours <= 0 {
+					continue
+				}
+				durHours := (dayDurHours / 24.0) * hours
+				kwh := ((mem / 1024.0) * durHours * x86Coeff.MinWatts * PUE) / 1000.0
+				opsKg := (kwh * p.Intensity) / 1000.0
+				dailyOps += opsKg
+				addSeriesOps(p.Timestamp, opsKg)
+			}
+
+			impacts = append(impacts, ResourceImpact{
+				Type: res.Type, Name: res.Name, Instance: "Serverless",
+				Count: 1, DailyOps: dailyOps, DailyEmb: 0, TotalDaily: dailyOps,
+			})
+			totalOps += dailyOps
+		}
+	}
+
+	opsSeries := make([]OpsEmissionPoint, 0, len(opsByTimestamp))
+	for ts, emissions := range opsByTimestamp {
+		opsSeries = append(opsSeries, OpsEmissionPoint{Timestamp: ts, Emissions: emissions})
+	}
+	sort.Slice(opsSeries, func(i, j int) bool {
+		return opsSeries[i].Timestamp.Before(opsSeries[j].Timestamp)
+	})
+
+	return impacts, totalOps, totalEmb, opsSeries
+}
+
+func normalizeIntensityData(points []CarbonIntensityPoint) []CarbonIntensityPoint {
+	out := make([]CarbonIntensityPoint, 0, len(points))
+	for _, p := range points {
+		if p.Intensity <= 0 || p.Timestamp.IsZero() {
+			continue
+		}
+		out = append(out, CarbonIntensityPoint{
+			Timestamp: p.Timestamp.UTC(),
+			Intensity: p.Intensity,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Timestamp.Before(out[j].Timestamp)
+	})
+	dedup := make([]CarbonIntensityPoint, 0, len(out))
+	for _, p := range out {
+		if len(dedup) > 0 && dedup[len(dedup)-1].Timestamp.Equal(p.Timestamp) {
+			dedup[len(dedup)-1] = p
+			continue
+		}
+		dedup = append(dedup, p)
+	}
+	return dedup
+}
+
+func seriesIntervalHours(points []CarbonIntensityPoint, idx int) float64 {
+	if idx < 0 || idx >= len(points) {
+		return 0
+	}
+	if idx < len(points)-1 {
+		h := points[idx+1].Timestamp.Sub(points[idx].Timestamp).Hours()
+		if h > 0 {
+			return h
+		}
+	}
+	if idx > 0 {
+		h := points[idx].Timestamp.Sub(points[idx-1].Timestamp).Hours()
+		if h > 0 {
+			return h
+		}
+	}
+	return 1.0
+}
+
+func utilizationAtTime(s UtilizationSchedule, ts time.Time) float64 {
+	s = normalizeSchedule(s)
+	hour := ts.UTC().Hour()
+	work := false
+	if s.WorkStartHour == s.WorkEndHour {
+		work = true
+	} else if s.WorkStartHour < s.WorkEndHour {
+		work = hour >= s.WorkStartHour && hour < s.WorkEndHour
+	} else {
+		work = hour >= s.WorkStartHour || hour < s.WorkEndHour
+	}
+	if work {
+		return s.WorkPct / 100.0
+	}
+	return s.IdlePct / 100.0
 }
 
 func normalizeSchedule(s UtilizationSchedule) UtilizationSchedule {

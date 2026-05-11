@@ -2,9 +2,13 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strings"
+	"time"
 
+	"github.com/NimbleMarkets/ntcharts/v2/linechart"
+	"github.com/NimbleMarkets/ntcharts/v2/linechart/timeserieslinechart"
 	"github.com/charmbracelet/bubbles/table"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -389,6 +393,8 @@ func (m model) buildMainContent() string {
 		"",
 		m.buildImpactTable(),
 		"",
+		m.buildOpsSeriesChart(),
+		"",
 		m.buildMatrixTable(),
 		"",
 		m.buildCostTable(),
@@ -690,6 +696,92 @@ func (m model) buildCostTable() string {
 		BorderForeground(clrBlue).
 		Padding(0, 1).
 		Render(sectionHeadStyle.Render("💵  Regional Cost Comparison") + "\n\n" + t.View() + "\n\n" + summary.String())
+}
+
+func (m model) buildOpsSeriesChart() string {
+	if len(m.opsSeries) == 0 {
+		return focusedBorderStyle.
+			BorderForeground(clrBlue).
+			Padding(0, 1).
+			Render(sectionHeadStyle.Render("📈  Operational Emissions Time Series") + "\n\n" +
+				mutedStyle.Render("No time-series emissions data available."))
+	}
+
+	chartW := m.vpWidth() - 8
+	if chartW < 48 {
+		chartW = 48
+	}
+	chartH := 10
+	minT := m.opsSeries[0].Timestamp
+	maxT := m.opsSeries[len(m.opsSeries)-1].Timestamp
+	if !maxT.After(minT) {
+		maxT = minT.Add(time.Hour)
+	}
+	minY := math.Inf(1)
+	maxY := math.Inf(-1)
+	points := make([]timeserieslinechart.TimePoint, 0, len(m.opsSeries))
+	for _, p := range m.opsSeries {
+		points = append(points, timeserieslinechart.TimePoint{
+			Time:  p.Timestamp,
+			Value: p.Emissions,
+		})
+		if p.Emissions < minY {
+			minY = p.Emissions
+		}
+		if p.Emissions > maxY {
+			maxY = p.Emissions
+		}
+	}
+	if !(maxY > minY) {
+		if maxY <= 0 {
+			maxY = 1
+		}
+		minY = maxY * 0.9
+		maxY = maxY * 1.1
+	}
+	pad := (maxY - minY) * 0.25
+	lo := minY - pad
+	if lo < 0 {
+		lo = 0
+	}
+	hi := maxY + pad
+
+	unit, scale := emissionsUnit(hi)
+	yLabel := func(_ int, v float64) string {
+		return fmt.Sprintf("%.2f%s", v*scale, unit)
+	}
+
+	chart := timeserieslinechart.New(chartW, chartH,
+		timeserieslinechart.WithTimeRange(minT, maxT),
+		timeserieslinechart.WithYRange(lo, hi),
+		timeserieslinechart.WithXLabelFormatter(timeserieslinechart.HourTimeLabelFormatter()),
+		timeserieslinechart.WithYLabelFormatter(linechart.LabelFormatter(yLabel)),
+		timeserieslinechart.WithTimeSeries(points),
+		timeserieslinechart.WithUpdateHandler(timeserieslinechart.HourNoZoomUpdateHandler(1)),
+	)
+	chart.DrawXYAxisAndLabel()
+	chart.Draw()
+
+	header := sectionHeadStyle.Render("📈  Operational Emissions Time Series") +
+		"  " + mutedStyle.Render(fmt.Sprintf("(CO₂e %s)", strings.TrimSpace(unit)))
+	return focusedBorderStyle.
+		BorderForeground(clrBlue).
+		Padding(0, 1).
+		Render(header + "\n\n" + chart.View())
+}
+
+// emissionsUnit chooses a display unit for kg-CO₂e values. Returns the unit
+// suffix and a multiplicative scale to apply when formatting. The chart's
+// internal Y range stays in kg so it composes with the underlying data.
+func emissionsUnit(maxKg float64) (string, float64) {
+	switch {
+	case maxKg >= 1:
+		return "kg", 1
+	case maxKg >= 0.001:
+		return "g", 1000
+	default:
+		return "mg", 1_000_000
+	}
 }
 
 // ── Utility ───────────────────────────────────────────────────────────────────
