@@ -11,6 +11,8 @@ import (
 	"github.com/NimbleMarkets/ntcharts/v2/linechart/timeserieslinechart"
 	"github.com/charmbracelet/bubbles/table"
 	"github.com/charmbracelet/lipgloss"
+
+	lipglossv2 "charm.land/lipgloss/v2"
 )
 
 // ── Colour palette ────────────────────────────────────────────────────────────
@@ -374,10 +376,44 @@ func (m model) renderSidePanel() string {
 	if isFocused {
 		borderStyle = focusedBorderStyle
 	}
+
+	// Clip body to the panel height with auto-scroll so the focused item stays
+	// visible. Without this, the Projected Savings block can push the layout
+	// past the screen bottom.
+	body := clipSidePanel(b.String(), m.vpHeight(), isFocused)
+
 	return borderStyle.
 		Width(sideW - 2). // -2 for the two border chars
 		Height(m.vpHeight()).
-		Render(b.String())
+		Render(body)
+}
+
+// clipSidePanel windows `body` to at most `h` lines, scrolling so the focused
+// cursor marker ("▶ ") is in view. When isFocused is false, the top of the
+// panel is shown. When the content already fits, body is returned as-is.
+func clipSidePanel(body string, h int, isFocused bool) string {
+	if h < 1 {
+		h = 1
+	}
+	lines := strings.Split(body, "\n")
+	if len(lines) <= h {
+		return body
+	}
+	focusLine := 0
+	if isFocused {
+		marker := greenBoldStyle.Render("▶ ")
+		if idx := strings.Index(body, marker); idx >= 0 {
+			focusLine = strings.Count(body[:idx], "\n")
+		}
+	}
+	start := focusLine - h/3
+	if start+h > len(lines) {
+		start = len(lines) - h
+	}
+	if start < 0 {
+		start = 0
+	}
+	return strings.Join(lines[start:start+h], "\n")
 }
 
 // ── Main viewport content ─────────────────────────────────────────────────────
@@ -411,7 +447,23 @@ func (m model) buildImpactTable() string {
 	// sets the *content* area (excl. padding), so each column renders col_width+2
 	// chars at runtime. We must subtract that from the available space or the
 	// table overflows the viewport.
-	// Overhead: box border(2) + box padding(2) + 7 cols × cell padding(2) = 18
+
+	// Side-by-side comparison view: only render when sim is done, sim data
+	// is present, and the viewport is wide enough to fit all 12 columns.
+	wide := m.simDone && len(m.simImpacts) > 0
+	if wide {
+		// Overhead: border(2) + padding(2) + 12 cols × cell padding(2) = 28
+		const wideOverhead = 2 + 2 + 12*2
+		const wideFixed = 9 + 9 + 3 + 7 + 7 + 7 + 7 + 8 + 8 + 7 // 72
+		if m.vpWidth()-wideOverhead-wideFixed < 12 {
+			wide = false // not enough room for Type+Name; fall back
+		}
+	}
+
+	if wide {
+		return m.buildImpactTableWide()
+	}
+
 	const overhead = 2 + 2 + 7*2 // = 18
 	avail := m.vpWidth() - overhead
 	if avail < 50 {
@@ -476,6 +528,139 @@ func (m model) buildImpactTable() string {
 		BorderForeground(clrGreen).
 		Padding(0, 1).
 		Render(sectionHeadStyle.Render("📊  Resource Carbon Impact") + "\n\n" + t.View())
+}
+
+// buildImpactTableWide renders the 12-column baseline/sim comparison.
+// Columns are interleaved so each baseline metric sits next to its sim counterpart.
+func (m model) buildImpactTableWide() string {
+	const wideOverhead = 2 + 2 + 12*2
+	instW, simInstW, qtyW := 9, 9, 3
+	opsW, simOpsW := 7, 7
+	embW, simEmbW := 7, 7
+	totW, simTotW := 8, 8
+	pctW := 7
+	fixed := instW + simInstW + qtyW + opsW + simOpsW + embW + simEmbW + totW + simTotW + pctW
+	avail := m.vpWidth() - wideOverhead
+	dyn := avail - fixed
+	if dyn < 12 {
+		dyn = 12
+	}
+
+	// Cap left-side Type+Name and redistribute the surplus across the right-side
+	// numeric columns so they don't feel cramped on wide terminals.
+	const maxLeft = 28
+	if dyn > maxLeft {
+		extra := dyn - maxLeft
+		dyn = maxLeft
+		each := extra / 9 // 9 right-side cols share the extra space
+		rem := extra - each*9
+		instW += each
+		simInstW += each
+		opsW += each
+		simOpsW += each
+		embW += each
+		simEmbW += each
+		totW += each
+		simTotW += each
+		pctW += each + rem
+	}
+
+	typeW := dyn / 2
+	nameW := dyn - typeW
+
+	widths := []int{typeW, nameW, instW, simInstW, qtyW, opsW, simOpsW, embW, simEmbW, totW, simTotW, pctW}
+	headers := []string{"Resource Type", "Name", "Instance", "Sim Inst", "Qty", "Ops kg", "Sim Ops", "Emb kg", "Sim Emb", "Total kg", "Sim Tot", "Δ %"}
+	// Bold the sim and delta columns (indexes match `headers`).
+	boldCol := map[int]bool{3: true, 6: true, 8: true, 10: true, 11: true}
+
+	simByKey := make(map[string]ResourceImpact, len(m.simImpacts))
+	for _, s := range m.simImpacts {
+		simByKey[s.Type+"\x00"+s.Name] = s
+	}
+
+	fmtPct := func(base, sim float64) string {
+		if base == 0 {
+			return "—"
+		}
+		p := (sim - base) / base * 100
+		if p >= 0 {
+			return fmt.Sprintf("+%.1f%%", p)
+		}
+		return fmt.Sprintf("%.1f%%", p)
+	}
+
+	var rows [][]string
+	for _, imp := range m.impacts {
+		sim, ok := simByKey[imp.Type+"\x00"+imp.Name]
+		simInst, simOps, simEmb, simTot, pct := "—", "—", "—", "—", "—"
+		if ok {
+			simInst = sim.Instance
+			simOps = fmt.Sprintf("%.4f", sim.DailyOps)
+			simEmb = fmt.Sprintf("%.4f", sim.DailyEmb)
+			simTot = fmt.Sprintf("%.4f", sim.TotalDaily)
+			pct = fmtPct(imp.TotalDaily, sim.TotalDaily)
+		}
+		rows = append(rows, []string{
+			imp.Type, imp.Name, imp.Instance, simInst,
+			fmt.Sprintf("%d", imp.Count),
+			fmt.Sprintf("%.4f", imp.DailyOps), simOps,
+			fmt.Sprintf("%.4f", imp.DailyEmb), simEmb,
+			fmt.Sprintf("%.4f", imp.TotalDaily), simTot,
+			pct,
+		})
+	}
+	baseTotal := m.totalOps + m.totalEmb
+	rows = append(rows, []string{
+		"── TOTALS ──", "", "", "", "",
+		fmt.Sprintf("%.4f", m.totalOps),
+		fmt.Sprintf("%.4f", m.simOps),
+		fmt.Sprintf("%.4f", m.totalEmb),
+		fmt.Sprintf("%.4f", m.simEmb),
+		fmt.Sprintf("%.4f", baseTotal),
+		fmt.Sprintf("%.4f", m.simTotal),
+		fmtPct(baseTotal, m.simTotal),
+	})
+
+	// Manual row rendering. We can't go through bubbles/table here because its
+	// renderRow runs runewidth.Truncate on cell values; that helper is ANSI-
+	// unaware and would chop the bold escape codes mid-sequence, breaking the
+	// table's visible width and pushing the side panel off-screen.
+	renderCell := func(value string, width int, bold, header bool) string {
+		style := lipgloss.NewStyle().Width(width).Inline(true)
+		if bold || header {
+			style = style.Bold(true)
+		}
+		if header {
+			style = style.Foreground(clrGreen)
+		}
+		return " " + style.Render(truncate(value, width)) + " "
+	}
+	renderRow := func(values []string, header bool) string {
+		cells := make([]string, len(values))
+		for i, v := range values {
+			cells[i] = renderCell(v, widths[i], boldCol[i], header)
+		}
+		return lipgloss.JoinHorizontal(lipgloss.Top, cells...)
+	}
+
+	totalW := 0
+	for _, w := range widths {
+		totalW += w + 2
+	}
+	sep := lipgloss.NewStyle().Foreground(clrDim).Render(strings.Repeat("─", totalW))
+
+	bodyLines := []string{renderRow(headers, true), sep}
+	for _, row := range rows {
+		bodyLines = append(bodyLines, renderRow(row, false))
+	}
+	body := strings.Join(bodyLines, "\n")
+
+	header := sectionHeadStyle.Render("📊  Resource Carbon Impact") +
+		"  " + mutedStyle.Render(fmt.Sprintf("(baseline ↔ optimized · %s)", m.simRegion))
+	return focusedBorderStyle.
+		BorderForeground(clrGreen).
+		Padding(0, 1).
+		Render(header + "\n\n" + body)
 }
 
 // ── Regional matrix table ─────────────────────────────────────────────────────
@@ -707,30 +892,43 @@ func (m model) buildOpsSeriesChart() string {
 				mutedStyle.Render("No time-series emissions data available."))
 	}
 
+	hasSim := m.simDone && len(m.simOpsSeries) > 0
+
 	chartW := m.vpWidth() - 8
 	if chartW < 48 {
 		chartW = 48
 	}
 	chartH := 10
+
 	minT := m.opsSeries[0].Timestamp
 	maxT := m.opsSeries[len(m.opsSeries)-1].Timestamp
+	if hasSim {
+		if m.simOpsSeries[0].Timestamp.Before(minT) {
+			minT = m.simOpsSeries[0].Timestamp
+		}
+		if last := m.simOpsSeries[len(m.simOpsSeries)-1].Timestamp; last.After(maxT) {
+			maxT = last
+		}
+	}
 	if !maxT.After(minT) {
 		maxT = minT.Add(time.Hour)
 	}
+
 	minY := math.Inf(1)
 	maxY := math.Inf(-1)
-	points := make([]timeserieslinechart.TimePoint, 0, len(m.opsSeries))
-	for _, p := range m.opsSeries {
-		points = append(points, timeserieslinechart.TimePoint{
-			Time:  p.Timestamp,
-			Value: p.Emissions,
-		})
-		if p.Emissions < minY {
-			minY = p.Emissions
+	collectRange := func(series []OpsEmissionPoint) {
+		for _, p := range series {
+			if p.Emissions < minY {
+				minY = p.Emissions
+			}
+			if p.Emissions > maxY {
+				maxY = p.Emissions
+			}
 		}
-		if p.Emissions > maxY {
-			maxY = p.Emissions
-		}
+	}
+	collectRange(m.opsSeries)
+	if hasSim {
+		collectRange(m.simOpsSeries)
 	}
 	if !(maxY > minY) {
 		if maxY <= 0 {
@@ -756,14 +954,35 @@ func (m model) buildOpsSeriesChart() string {
 		timeserieslinechart.WithYRange(lo, hi),
 		timeserieslinechart.WithXLabelFormatter(timeserieslinechart.HourTimeLabelFormatter()),
 		timeserieslinechart.WithYLabelFormatter(linechart.LabelFormatter(yLabel)),
-		timeserieslinechart.WithTimeSeries(points),
 		timeserieslinechart.WithUpdateHandler(timeserieslinechart.HourNoZoomUpdateHandler(1)),
 	)
 	chart.DrawXYAxisAndLabel()
-	chart.Draw()
+
+	chart.SetDataSetStyle("baseline", lipglossv2.NewStyle().Foreground(lipglossv2.Color("#6272A4")))
+	for _, p := range m.opsSeries {
+		chart.PushDataSet("baseline", timeserieslinechart.TimePoint{Time: p.Timestamp, Value: p.Emissions})
+	}
+
+	names := []string{"baseline"}
+	if hasSim {
+		chart.SetDataSetStyle("optimized", lipglossv2.NewStyle().Foreground(lipglossv2.Color("#00BF72")))
+		for _, p := range m.simOpsSeries {
+			chart.PushDataSet("optimized", timeserieslinechart.TimePoint{Time: p.Timestamp, Value: p.Emissions})
+		}
+		names = append(names, "optimized")
+	}
+	chart.DrawDataSets(names)
 
 	header := sectionHeadStyle.Render("📈  Operational Emissions Time Series") +
 		"  " + mutedStyle.Render(fmt.Sprintf("(CO₂e %s)", strings.TrimSpace(unit)))
+	if hasSim {
+		legend := "  " +
+			lipgloss.NewStyle().Foreground(clrBlue).Render("● current") +
+			"  " +
+			lipgloss.NewStyle().Foreground(clrGreen).Render("● optimized") +
+			mutedStyle.Render(" · "+m.simRegion)
+		header += legend
+	}
 	return focusedBorderStyle.
 		BorderForeground(clrBlue).
 		Padding(0, 1).

@@ -25,6 +25,8 @@ type simCompleteMsg struct {
 	targetRegion string
 	targetCost   CostSummary
 	pricingWarn  string
+	impacts      []ResourceImpact
+	opsSeries    []OpsEmissionPoint
 }
 
 // ── Initial model ─────────────────────────────────────────────────────────────
@@ -252,6 +254,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.baselineWarn = msg.pricingWarn
 		m.pricingWarn = msg.pricingWarn
 		m.simDone = false
+		m.simImpacts = nil
+		m.simOpsSeries = nil
+		m.simRegion = ""
 		if !msg.skipAIFetch {
 			m.aiContent = ""
 			m.aiLoading = true
@@ -296,6 +301,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.simTotal = msg.total
 		m.targetCost = msg.targetCost
 		m.pricingWarn = combineWarnings(m.baselineWarn, msg.pricingWarn)
+		m.simImpacts = msg.impacts
+		m.simOpsSeries = msg.opsSeries
+		m.simRegion = msg.targetRegion
 		m.simDone = true
 		if m.mainVPReady {
 			m.mainVP.SetContent(m.buildMainContent())
@@ -382,6 +390,9 @@ func (m model) updateResults(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.state = stateFilePicker
 		m.mainVPReady = false
 		m.simDone = false
+		m.simImpacts = nil
+		m.simOpsSeries = nil
+		m.simRegion = ""
 		m.errMsg = ""
 		return m, nil
 	}
@@ -638,6 +649,9 @@ func (m model) triggerReanalysis() (model, tea.Cmd) {
 	m.loadMsg = "Re-analysing with updated settings…"
 	m.mainVPReady = false
 	m.simDone = false
+	m.simImpacts = nil
+	m.simOpsSeries = nil
+	m.simRegion = ""
 	if m.cachedPlan == nil {
 		return m, tea.Batch(
 			m.spinner.Tick,
@@ -671,7 +685,7 @@ func (m model) applyOptimization() (model, tea.Cmd) {
 	if m.optType == "graviton" {
 		// Pure local computation — no HTTP needed
 		simPlan := simulateGraviton(m.plan)
-		_, simOps, simEmb, _ := calculateImpactWithSeries(
+		simImpacts, simOps, simEmb, simOpsSeries := calculateImpactWithSeries(
 			&simPlan, m.region, m.intensityData,
 			m.embodiedData, m.vcpuMap, m.x86Coeff, m.armCoeff,
 			m.networkProfile, m.lambdaInvocations, m.utilization,
@@ -679,6 +693,9 @@ func (m model) applyOptimization() (model, tea.Cmd) {
 		m.simOps = simOps
 		m.simEmb = simEmb
 		m.simTotal = simOps + simEmb
+		m.simImpacts = simImpacts
+		m.simOpsSeries = simOpsSeries
+		m.simRegion = m.region
 		targetCost, warn := buildCostSummary(&simPlan, m.region, m.lambdaInvocations)
 		m.targetCost = targetCost
 		m.pricingWarn = combineWarnings(m.baselineWarn, warn)
@@ -937,7 +954,7 @@ func runRegionSimCmd(
 				intensityCache[newRegion] = intensityData
 			}
 		}
-		_, simOps, simEmb, _ := calculateImpactWithSeries(
+		simImpacts, simOps, simEmb, simOpsSeries := calculateImpactWithSeries(
 			&plan, newRegion, intensityData, embodied, vcpuMap, x86, arm, networkProfile, lambdaInv, schedule,
 		)
 		targetCost, pricingWarn := buildCostSummary(&plan, newRegion, lambdaInv)
@@ -948,6 +965,8 @@ func runRegionSimCmd(
 			targetRegion: newRegion,
 			targetCost:   targetCost,
 			pricingWarn:  pricingWarn,
+			impacts:      simImpacts,
+			opsSeries:    simOpsSeries,
 		}
 	}
 }

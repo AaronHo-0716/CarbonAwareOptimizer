@@ -271,10 +271,13 @@ type model struct {
 	intensityCache    map[string][]CarbonIntensityPoint
 
 	// Simulation result (after clicking Apply)
-	simOps   float64
-	simEmb   float64
-	simTotal float64
-	simDone  bool
+	simOps       float64
+	simEmb       float64
+	simTotal     float64
+	simDone      bool
+	simImpacts   []ResourceImpact
+	simOpsSeries []OpsEmissionPoint
+	simRegion    string
 
 	// General error text (shown in file-picker view)
 	errMsg string
