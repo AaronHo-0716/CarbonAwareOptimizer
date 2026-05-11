@@ -279,6 +279,7 @@ func calculateImpact(
 	embodiedData map[string]float64, vcpuMap map[string]int,
 	x86Coeff, armCoeff UseCoeff,
 	networkProfile string, lambdaInvocations int,
+	schedule UtilizationSchedule,
 ) ([]ResourceImpact, float64, float64) {
 	const PUE = 1.135
 	const LifespanDays = 1460.0
@@ -326,7 +327,8 @@ func calculateImpact(
 				coeff = armCoeff
 			}
 
-			avgW := coeff.MinWatts + (coeff.MaxWatts-coeff.MinWatts)*0.5
+			utilization := scheduleUtilization(schedule)
+			avgW := coeff.MinWatts + (coeff.MaxWatts-coeff.MinWatts)*utilization
 			dailyKwh := (avgW * vcpus * 24.0 * PUE) / 1000.0
 			dailyOps := (dailyKwh * gridIntensity / 1000.0) * count
 
@@ -411,6 +413,65 @@ func calculateImpact(
 		}
 	}
 	return impacts, totalOps, totalEmb
+}
+
+func normalizeSchedule(s UtilizationSchedule) UtilizationSchedule {
+	normalized := UtilizationSchedule{
+		WorkStartHour: s.WorkStartHour,
+		WorkEndHour:   s.WorkEndHour,
+		WorkPct:       s.WorkPct,
+		IdlePct:       s.IdlePct,
+	}
+	if normalized.WorkStartHour < 0 || normalized.WorkStartHour > 23 {
+		normalized.WorkStartHour = 0
+	}
+	if normalized.WorkEndHour < 0 || normalized.WorkEndHour > 24 {
+		normalized.WorkEndHour = 24
+	}
+	if normalized.WorkPct < 0 || normalized.WorkPct > 100 {
+		normalized.WorkPct = 50
+	}
+	if normalized.IdlePct < 0 || normalized.IdlePct > 100 {
+		normalized.IdlePct = 50
+	}
+	return normalized
+}
+
+func scheduleUtilization(s UtilizationSchedule) float64 {
+	s = normalizeSchedule(s)
+	workHours := scheduleWorkHours(s.WorkStartHour, s.WorkEndHour)
+	idleHours := 24 - workHours
+	weighted := (float64(workHours)*s.WorkPct + float64(idleHours)*s.IdlePct) / (24.0 * 100.0)
+	if weighted < 0 {
+		return 0
+	}
+	if weighted > 1 {
+		return 1
+	}
+	return weighted
+}
+
+func scheduleWorkHours(start, end int) int {
+	if start < 0 {
+		start = 0
+	}
+	if start > 23 {
+		start = 23
+	}
+	if end < 0 {
+		end = 0
+	}
+	if end > 24 {
+		end = 24
+	}
+	if end == start {
+		return 24
+	}
+	if end > start {
+		return end - start
+	}
+	// Wrap-around window, e.g. 22 -> 6.
+	return (24 - start) + end
 }
 
 func trafficByProfile(profile string) float64 {

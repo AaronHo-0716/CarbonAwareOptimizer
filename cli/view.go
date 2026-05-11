@@ -252,37 +252,51 @@ func (m model) renderSidePanel() string {
 
 	var b strings.Builder
 
-	// ── Settings section (only if relevant resources exist) ───────────────────
-	if m.hasNetworkRes || m.hasLambdaRes {
-		b.WriteString(sectionHeadStyle.Render("⚙  Settings") + "\n\n")
+	// ── Settings section ───────────────────────────────────────────────────────
+	b.WriteString(sectionHeadStyle.Render("⚙  Settings") + "\n\n")
 
-		if isActive(sideNetworkProfile) {
-			profileLabel := map[string]string{
-				"low":    "Low   ( 10 GB/mo)",
-				"medium": "Med  (100 GB/mo)",
-				"high":   "High  ( 1 TB/mo)",
-			}[m.networkProfile]
+	if isActive(sideNetworkProfile) {
+		profileLabel := map[string]string{
+			"low":    "Low   ( 10 GB/mo)",
+			"medium": "Med  (100 GB/mo)",
+			"high":   "High  ( 1 TB/mo)",
+		}[m.networkProfile]
 
-			focused := isFocused && m.sideFocused == sideNetworkProfile
-			b.WriteString(cursor(sideNetworkProfile) + mutedStyle.Render("Network Traffic") + "\n")
-			if focused {
-				b.WriteString("  " + greenBoldStyle.Render("◀ "+profileLabel+" ▶") + "\n\n")
-			} else {
-				b.WriteString("  " + dimStyle.Render("◀") + " " + profileLabel + " " + dimStyle.Render("▶") + "\n\n")
-			}
+		focused := isFocused && m.sideFocused == sideNetworkProfile
+		b.WriteString(cursor(sideNetworkProfile) + mutedStyle.Render("Network Traffic") + "\n")
+		if focused {
+			b.WriteString("  " + greenBoldStyle.Render("◀ "+profileLabel+" ▶") + "\n\n")
+		} else {
+			b.WriteString("  " + dimStyle.Render("◀") + " " + profileLabel + " " + dimStyle.Render("▶") + "\n\n")
 		}
-
-		if isActive(sideLambdaInput) {
-			b.WriteString(cursor(sideLambdaInput) + mutedStyle.Render("Lambda Invoc./day") + "\n")
-			b.WriteString("  " + m.lambdaInput.View() + "\n\n")
-		}
-
-		if isActive(sideReanalyze) {
-			b.WriteString(cursor(sideReanalyze) + btn("  Re-analyse  ", sideReanalyze) + "\n\n")
-		}
-
-		b.WriteString(dimStyle.Render(strings.Repeat("─", sideW-4)) + "\n\n")
 	}
+
+	if isActive(sideLambdaInput) {
+		b.WriteString(cursor(sideLambdaInput) + mutedStyle.Render("Lambda Invoc./day") + "\n")
+		b.WriteString("  " + m.lambdaInput.View() + "\n\n")
+	}
+
+	if isActive(sideWorkStartHour) {
+		b.WriteString(cursor(sideWorkStartHour) + mutedStyle.Render("Work start (0-23)") + "\n")
+		b.WriteString("  " + m.workStartInput.View() + "\n\n")
+	}
+	if isActive(sideWorkEndHour) {
+		b.WriteString(cursor(sideWorkEndHour) + mutedStyle.Render("Work end (1-24)") + "\n")
+		b.WriteString("  " + m.workEndInput.View() + "\n\n")
+	}
+	if isActive(sideWorkUtilPct) {
+		b.WriteString(cursor(sideWorkUtilPct) + mutedStyle.Render("Work util (%)") + "\n")
+		b.WriteString("  " + m.workUtilInput.View() + "\n\n")
+	}
+	if isActive(sideIdleUtilPct) {
+		b.WriteString(cursor(sideIdleUtilPct) + mutedStyle.Render("Idle util (%)") + "\n")
+		b.WriteString("  " + m.idleUtilInput.View() + "\n\n")
+	}
+
+	if isActive(sideReanalyze) {
+		b.WriteString(cursor(sideReanalyze) + btn("  Re-analyse  ", sideReanalyze) + "\n\n")
+	}
+	b.WriteString(dimStyle.Render(strings.Repeat("─", sideW-4)) + "\n\n")
 
 	// ── Optimisation section ──────────────────────────────────────────────────
 	b.WriteString(sectionHeadStyle.Render("🔧  Optimise") + "\n\n")
@@ -365,7 +379,14 @@ func (m model) renderSidePanel() string {
 // ── Main viewport content ─────────────────────────────────────────────────────
 
 func (m model) buildMainContent() string {
+	schedule := normalizeSchedule(m.utilization)
+	workHours := scheduleWorkHours(schedule.WorkStartHour, schedule.WorkEndHour)
+	idleHours := 24 - workHours
 	parts := []string{
+		sectionHeadStyle.Render("⏱  Utilization Schedule") + "\n" +
+			fmt.Sprintf("Every day: %02d:00-%02d:00 work (%d h @ %.0f%%), idle (%d h @ %.0f%%)",
+				schedule.WorkStartHour, schedule.WorkEndHour, workHours, schedule.WorkPct, idleHours, schedule.IdlePct),
+		"",
 		m.buildImpactTable(),
 		"",
 		m.buildMatrixTable(),

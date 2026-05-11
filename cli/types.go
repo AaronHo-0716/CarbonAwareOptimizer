@@ -38,6 +38,13 @@ type UseCoeff struct {
 	MaxWatts float64
 }
 
+type UtilizationSchedule struct {
+	WorkStartHour int
+	WorkEndHour   int
+	WorkPct       float64
+	IdlePct       float64
+}
+
 type ResourceImpact struct {
 	Type       string
 	Name       string
@@ -128,6 +135,10 @@ type sideItem int
 const (
 	sideNetworkProfile sideItem = iota
 	sideLambdaInput
+	sideWorkStartHour
+	sideWorkEndHour
+	sideWorkUtilPct
+	sideIdleUtilPct
 	sideReanalyze
 	sideOptGraviton
 	sideOptRegion
@@ -223,6 +234,11 @@ type model struct {
 	networkProfile    string // "low" | "medium" | "high"
 	lambdaInput       textinput.Model
 	lambdaInvocations int
+	workStartInput    textinput.Model
+	workEndInput      textinput.Model
+	workUtilInput     textinput.Model
+	idleUtilInput     textinput.Model
+	utilization       UtilizationSchedule
 	sideFocused       sideItem // currently focused side-panel element
 	optType           string   // "graviton" | "region"
 	regionInput       textinput.Model

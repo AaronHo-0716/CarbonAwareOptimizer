@@ -54,6 +54,7 @@ func buildRegionalMatrix(
 	x86Coeff, armCoeff UseCoeff,
 	networkProfile string,
 	lambdaInvocations int,
+	schedule UtilizationSchedule,
 ) ([]MatrixRow, string) {
 	group := getRegionGroup(currentRegion)
 
@@ -109,7 +110,7 @@ func buildRegionalMatrix(
 		_, simOps, simEmb := calculateImpact(
 			&plan, res.Region, res.Intensity,
 			embodiedData, vcpuMap, x86Coeff, armCoeff,
-			networkProfile, lambdaInvocations,
+			networkProfile, lambdaInvocations, schedule,
 		)
 		simTotal := simOps + simEmb
 		costSummary, _ := buildCostSummary(&plan, res.Region, lambdaInvocations)

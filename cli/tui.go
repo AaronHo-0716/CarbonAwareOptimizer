@@ -47,6 +47,26 @@ func initialModel() model {
 	lambdaIn.CharLimit = 10
 	lambdaIn.Width = sideW - 6
 
+	workStartIn := textinput.New()
+	workStartIn.SetValue("0")
+	workStartIn.CharLimit = 2
+	workStartIn.Width = sideW - 6
+
+	workEndIn := textinput.New()
+	workEndIn.SetValue("24")
+	workEndIn.CharLimit = 2
+	workEndIn.Width = sideW - 6
+
+	workUtilIn := textinput.New()
+	workUtilIn.SetValue("50")
+	workUtilIn.CharLimit = 3
+	workUtilIn.Width = sideW - 6
+
+	idleUtilIn := textinput.New()
+	idleUtilIn.SetValue("50")
+	idleUtilIn.CharLimit = 3
+	idleUtilIn.Width = sideW - 6
+
 	regionIn := textinput.New()
 	regionIn.Placeholder = "e.g. eu-west-1"
 	regionIn.CharLimit = 20
@@ -96,6 +116,11 @@ func initialModel() model {
 		networkProfile:    "medium",
 		lambdaInput:       lambdaIn,
 		lambdaInvocations: 50000,
+		workStartInput:    workStartIn,
+		workEndInput:      workEndIn,
+		workUtilInput:     workUtilIn,
+		idleUtilInput:     idleUtilIn,
+		utilization:       normalizeSchedule(UtilizationSchedule{WorkStartHour: 0, WorkEndHour: 24, WorkPct: 50, IdlePct: 50}),
 		optType:           "graviton",
 		regionInput:       regionIn,
 		sideFocused:       sideOptGraviton,
@@ -182,7 +207,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, tea.Batch(
 						m.spinner.Tick,
 						runAnalysisCmd(path, m.emToken, m.embodiedData, m.vcpuMap,
-							m.x86Coeff, m.armCoeff, m.networkProfile, m.lambdaInvocations),
+							m.x86Coeff, m.armCoeff, m.networkProfile, m.lambdaInvocations, m.utilization),
 					)
 				}
 				return m, nil
@@ -224,10 +249,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.aiLoading = true
 		m.state = stateResults
 
-		// Reset side-panel to sane defaults
-		m.networkProfile = "medium"
-		m.lambdaInput.SetValue("50000")
-		m.lambdaInvocations = 50000
+		// Keep latest side-panel settings so the displayed assumptions match analysis.
 
 		// Smart default: focus on graviton option, or the first available item
 		active := m.activeSideItems()
@@ -369,7 +391,7 @@ func (m model) updateResults(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m model) updateSidePanel(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Text-input items intercept most keystrokes
 	switch m.sideFocused {
-	case sideLambdaInput:
+	case sideLambdaInput, sideWorkStartHour, sideWorkEndHour, sideWorkUtilPct, sideIdleUtilPct:
 		switch msg.String() {
 		case "up", "k":
 			m.sideFocused = m.prevSideItem()
@@ -381,9 +403,7 @@ func (m model) updateSidePanel(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.focus = focusMain
 			return m.syncInputFocus()
 		default:
-			var cmd tea.Cmd
-			m.lambdaInput, cmd = m.lambdaInput.Update(msg)
-			return m, cmd
+			return m.updateFocusedSideInput(msg)
 		}
 
 	case sideRegionInput:
@@ -449,6 +469,23 @@ func (m model) updateSidePanel(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m model) updateFocusedSideInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	var cmd tea.Cmd
+	switch m.sideFocused {
+	case sideLambdaInput:
+		m.lambdaInput, cmd = m.lambdaInput.Update(msg)
+	case sideWorkStartHour:
+		m.workStartInput, cmd = m.workStartInput.Update(msg)
+	case sideWorkEndHour:
+		m.workEndInput, cmd = m.workEndInput.Update(msg)
+	case sideWorkUtilPct:
+		m.workUtilInput, cmd = m.workUtilInput.Update(msg)
+	case sideIdleUtilPct:
+		m.idleUtilInput, cmd = m.idleUtilInput.Update(msg)
+	}
+	return m, cmd
+}
+
 // ── Side-panel helpers ────────────────────────────────────────────────────────
 
 // activeSideItems returns the list of interactive elements currently shown,
@@ -461,9 +498,13 @@ func (m model) activeSideItems() []sideItem {
 	if m.hasLambdaRes {
 		items = append(items, sideLambdaInput)
 	}
-	if m.hasNetworkRes || m.hasLambdaRes {
-		items = append(items, sideReanalyze)
-	}
+	items = append(items,
+		sideWorkStartHour,
+		sideWorkEndHour,
+		sideWorkUtilPct,
+		sideIdleUtilPct,
+		sideReanalyze,
+	)
 	items = append(items, sideOptGraviton, sideOptRegion)
 	if m.optType == "region" {
 		items = append(items, sideRegionInput)
@@ -510,11 +551,27 @@ func (m model) prevSideItem() sideItem {
 // Returns an updated model copy and the optional blink command from Focus().
 func (m model) syncInputFocus() (model, tea.Cmd) {
 	m.lambdaInput.Blur()
+	m.workStartInput.Blur()
+	m.workEndInput.Blur()
+	m.workUtilInput.Blur()
+	m.idleUtilInput.Blur()
 	m.regionInput.Blur()
 	if m.focus == focusSide {
 		switch m.sideFocused {
 		case sideLambdaInput:
 			cmd := m.lambdaInput.Focus()
+			return m, cmd
+		case sideWorkStartHour:
+			cmd := m.workStartInput.Focus()
+			return m, cmd
+		case sideWorkEndHour:
+			cmd := m.workEndInput.Focus()
+			return m, cmd
+		case sideWorkUtilPct:
+			cmd := m.workUtilInput.Focus()
+			return m, cmd
+		case sideIdleUtilPct:
+			cmd := m.idleUtilInput.Focus()
 			return m, cmd
 		case sideRegionInput:
 			cmd := m.regionInput.Focus()
@@ -554,6 +611,16 @@ func (m model) triggerReanalysis() (model, tea.Cmd) {
 		inv = 50000
 	}
 	m.lambdaInvocations = inv
+	m.utilization = parseUtilizationScheduleFromInputs(
+		m.workStartInput.Value(),
+		m.workEndInput.Value(),
+		m.workUtilInput.Value(),
+		m.idleUtilInput.Value(),
+	)
+	m.workStartInput.SetValue(strconv.Itoa(m.utilization.WorkStartHour))
+	m.workEndInput.SetValue(strconv.Itoa(m.utilization.WorkEndHour))
+	m.workUtilInput.SetValue(strconv.Itoa(int(m.utilization.WorkPct)))
+	m.idleUtilInput.SetValue(strconv.Itoa(int(m.utilization.IdlePct)))
 	m.state = stateLoading
 	m.loadMsg = "Re-analysing with updated settings…"
 	m.mainVPReady = false
@@ -562,20 +629,31 @@ func (m model) triggerReanalysis() (model, tea.Cmd) {
 	return m, tea.Batch(
 		m.spinner.Tick,
 		runAnalysisCmd(m.selectedPath, m.emToken, m.embodiedData, m.vcpuMap,
-			m.x86Coeff, m.armCoeff, m.networkProfile, m.lambdaInvocations),
+			m.x86Coeff, m.armCoeff, m.networkProfile, m.lambdaInvocations, m.utilization),
 	)
 }
 
 // ── Optimisation simulation ───────────────────────────────────────────────────
 
 func (m model) applyOptimization() (model, tea.Cmd) {
+	m.utilization = parseUtilizationScheduleFromInputs(
+		m.workStartInput.Value(),
+		m.workEndInput.Value(),
+		m.workUtilInput.Value(),
+		m.idleUtilInput.Value(),
+	)
+	m.workStartInput.SetValue(strconv.Itoa(m.utilization.WorkStartHour))
+	m.workEndInput.SetValue(strconv.Itoa(m.utilization.WorkEndHour))
+	m.workUtilInput.SetValue(strconv.Itoa(int(m.utilization.WorkPct)))
+	m.idleUtilInput.SetValue(strconv.Itoa(int(m.utilization.IdlePct)))
+
 	if m.optType == "graviton" {
 		// Pure local computation — no HTTP needed
 		simPlan := simulateGraviton(m.plan)
 		_, simOps, simEmb := calculateImpact(
 			&simPlan, m.region, m.gridIntensity,
 			m.embodiedData, m.vcpuMap, m.x86Coeff, m.armCoeff,
-			m.networkProfile, m.lambdaInvocations,
+			m.networkProfile, m.lambdaInvocations, m.utilization,
 		)
 		m.simOps = simOps
 		m.simEmb = simEmb
@@ -598,7 +676,7 @@ func (m model) applyOptimization() (model, tea.Cmd) {
 	return m, runRegionSimCmd(
 		newRegion, m.emToken, m.plan,
 		m.embodiedData, m.vcpuMap, m.x86Coeff, m.armCoeff,
-		m.networkProfile, m.lambdaInvocations,
+		m.networkProfile, m.lambdaInvocations, m.utilization,
 	)
 }
 
@@ -617,6 +695,23 @@ func combineWarnings(base, sim string) string {
 	default:
 		return base + "\n" + sim
 	}
+}
+
+func parseUtilizationScheduleFromInputs(startS, endS, workPctS, idlePctS string) UtilizationSchedule {
+	s := UtilizationSchedule{WorkStartHour: 0, WorkEndHour: 24, WorkPct: 50, IdlePct: 50}
+	if v, err := strconv.Atoi(strings.TrimSpace(startS)); err == nil {
+		s.WorkStartHour = v
+	}
+	if v, err := strconv.Atoi(strings.TrimSpace(endS)); err == nil {
+		s.WorkEndHour = v
+	}
+	if v, err := strconv.Atoi(strings.TrimSpace(workPctS)); err == nil {
+		s.WorkPct = float64(v)
+	}
+	if v, err := strconv.Atoi(strings.TrimSpace(idlePctS)); err == nil {
+		s.IdlePct = float64(v)
+	}
+	return normalizeSchedule(s)
 }
 
 // ── Layout helpers ────────────────────────────────────────────────────────────
@@ -646,6 +741,7 @@ func runAnalysisCmd(
 	embodied map[string]float64, vcpuMap map[string]int,
 	x86, arm UseCoeff,
 	networkProfile string, lambdaInv int,
+	schedule UtilizationSchedule,
 ) tea.Cmd {
 	return func() tea.Msg {
 		plan, err := loadPlan(path)
@@ -655,7 +751,7 @@ func runAnalysisCmd(
 		region := extractRegion(plan)
 		intensity := getGridIntensityQuiet(emToken, region)
 		impacts, totalOps, totalEmb := calculateImpact(
-			&plan, region, intensity, embodied, vcpuMap, x86, arm, networkProfile, lambdaInv,
+			&plan, region, intensity, embodied, vcpuMap, x86, arm, networkProfile, lambdaInv, schedule,
 		)
 		baselineCost, pricingWarn := buildCostSummary(&plan, region, lambdaInv)
 
@@ -671,7 +767,7 @@ func runAnalysisCmd(
 		hasNetwork, hasLambda := detectResourceTypes(plan)
 		matrixData, matrixCtx := buildRegionalMatrix(
 			emToken, region, intensity, totalOps,
-			plan, embodied, vcpuMap, x86, arm, networkProfile, lambdaInv,
+			plan, embodied, vcpuMap, x86, arm, networkProfile, lambdaInv, schedule,
 		)
 
 		return analysisCompleteMsg{
@@ -709,11 +805,12 @@ func runRegionSimCmd(
 	embodied map[string]float64, vcpuMap map[string]int,
 	x86, arm UseCoeff,
 	networkProfile string, lambdaInv int,
+	schedule UtilizationSchedule,
 ) tea.Cmd {
 	return func() tea.Msg {
 		intensity := getGridIntensityQuiet(emToken, newRegion)
 		_, simOps, simEmb := calculateImpact(
-			&plan, newRegion, intensity, embodied, vcpuMap, x86, arm, networkProfile, lambdaInv,
+			&plan, newRegion, intensity, embodied, vcpuMap, x86, arm, networkProfile, lambdaInv, schedule,
 		)
 		targetCost, pricingWarn := buildCostSummary(&plan, newRegion, lambdaInv)
 		return simCompleteMsg{
