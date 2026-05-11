@@ -102,11 +102,12 @@ func buildCostSummary(plan *TFPlan, regionCode string, lambdaInvocations int) (C
 		case "aws_db_instance":
 			class := stringOrDefault(res.Values["instance_class"], "db.t3.medium")
 			engine := normalizeRDSEngine(stringOrDefault(res.Values["engine"], "mysql"))
+			deploymentOption := rdsDeploymentOption(res.Values["multi_az"])
 			row.Note = "On-Demand DB instance + allocated storage estimate"
-			instanceHourly, okInst, noteInst := lookupRDSInstanceHourly(client, regionCode, class, engine)
+			instanceHourly, okInst, noteInst := lookupRDSInstanceHourly(client, regionCode, class, engine, deploymentOption)
 			storageGB := floatOrDefault(res.Values["allocated_storage"], 0)
 			storageType := normalizeRDSStorageType(stringOrDefault(res.Values["storage_type"], "gp2"))
-			storageMonthlyPerGB, okStorage, noteStorage := lookupRDSStorageMonthlyPerGB(client, regionCode, storageType)
+			storageMonthlyPerGB, okStorage, noteStorage := lookupRDSStorageMonthlyPerGB(client, regionCode, storageType, engine)
 
 			if okInst {
 				row.Hourly += instanceHourly
@@ -227,21 +228,38 @@ func lookupEC2Hourly(client *pricingClient, regionCode, instanceType string) (fl
 	return price, true, "On-Demand Linux shared tenancy"
 }
 
-func lookupRDSInstanceHourly(client *pricingClient, regionCode, instanceType, engine string) (float64, bool, string) {
-	price, err := client.lookupPrice("AmazonRDS", regionCode, map[string]string{
+func lookupRDSInstanceHourly(client *pricingClient, regionCode, instanceType, engine, deploymentOption string) (float64, bool, string) {
+	filters := map[string]string{
 		"databaseEngine": engine,
 		"instanceType":   instanceType,
-	}, []string{"Hrs"}, nil)
+		"productFamily":  "Database Instance",
+	}
+	if deploymentOption != "" {
+		filters["deploymentOption"] = deploymentOption
+	}
+	price, err := client.lookupPrice("AmazonRDS", regionCode, filters, []string{"Hrs"}, []string{"instance", instanceType})
+	if err != nil && deploymentOption != "" {
+		delete(filters, "deploymentOption")
+		price, err = client.lookupPrice("AmazonRDS", regionCode, filters, []string{"Hrs"}, []string{"instance", instanceType})
+	}
 	if err != nil {
 		return 0, false, "AWS CLI query failed for RDS instance: " + err.Error()
 	}
 	return price, true, ""
 }
 
-func lookupRDSStorageMonthlyPerGB(client *pricingClient, regionCode, storageType string) (float64, bool, string) {
+func lookupRDSStorageMonthlyPerGB(client *pricingClient, regionCode, storageType, engine string) (float64, bool, string) {
 	price, err := client.lookupPrice("AmazonRDS", regionCode, map[string]string{
-		"volumeType": storageType,
-	}, []string{"GB-Mo"}, []string{"Storage"})
+		"volumeType":     storageType,
+		"productFamily":  "Database Storage",
+		"databaseEngine": engine,
+	}, []string{"GB-Mo"}, []string{"storage"})
+	if err != nil {
+		price, err = client.lookupPrice("AmazonRDS", regionCode, map[string]string{
+			"volumeType":    storageType,
+			"productFamily": "Database Storage",
+		}, []string{"GB-Mo"}, []string{"storage"})
+	}
 	if err != nil {
 		return 0, false, "AWS CLI query failed for RDS storage: " + err.Error()
 	}
@@ -394,16 +412,22 @@ func (c *pricingClient) lookupPrice(
 	if len(payload.PriceList) == 0 {
 		return 0, fmt.Errorf("no pricing entries")
 	}
+	best := -1.0
 	for _, item := range payload.PriceList {
-		if price, ok := extractOnDemandPrice(item, preferredUnits, descriptionContains); ok {
-			c.cache[cacheKey] = price
-			return price, nil
+		for _, price := range extractOnDemandPrices(item, preferredUnits, descriptionContains) {
+			if best < 0 || price < best {
+				best = price
+			}
 		}
+	}
+	if best >= 0 {
+		c.cache[cacheKey] = best
+		return best, nil
 	}
 	return 0, fmt.Errorf("no on-demand price dimension matched")
 }
 
-func extractOnDemandPrice(raw string, preferredUnits, descriptionContains []string) (float64, bool) {
+func extractOnDemandPrices(raw string, preferredUnits, descriptionContains []string) []float64 {
 	var doc struct {
 		Terms struct {
 			OnDemand map[string]struct {
@@ -416,9 +440,10 @@ func extractOnDemandPrice(raw string, preferredUnits, descriptionContains []stri
 		} `json:"terms"`
 	}
 	if err := json.Unmarshal([]byte(raw), &doc); err != nil {
-		return 0, false
+		return nil
 	}
 
+	var out []float64
 	for _, term := range doc.Terms.OnDemand {
 		for _, dim := range term.PriceDimensions {
 			if !matchAny(dim.Unit, preferredUnits) {
@@ -433,11 +458,11 @@ func extractOnDemandPrice(raw string, preferredUnits, descriptionContains []stri
 			}
 			v, err := strconv.ParseFloat(usd, 64)
 			if err == nil {
-				return v, true
+				out = append(out, v)
 			}
 		}
 	}
-	return 0, false
+	return out
 }
 
 func matchAny(value string, expected []string) bool {
@@ -536,4 +561,15 @@ func normalizeEBSVolumeType(volumeType string) string {
 	default:
 		return "General Purpose"
 	}
+}
+
+func rdsDeploymentOption(multiAZ interface{}) string {
+	v, ok := multiAZ.(bool)
+	if !ok {
+		return ""
+	}
+	if v {
+		return "Multi-AZ"
+	}
+	return "Single-AZ"
 }

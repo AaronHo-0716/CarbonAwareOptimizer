@@ -75,10 +75,13 @@ type AIResponse struct {
 
 // MatrixRow holds a single row of regional comparison data.
 type MatrixRow struct {
-	RegionName string
-	Intensity  float64
-	Total      float64
-	DeltaStr   string
+	RegionName  string
+	Intensity   float64
+	Total       float64
+	DeltaStr    string
+	HourlyCost  float64
+	MonthlyCost float64
+	CostKnown   bool
 }
 
 type CostResource struct {

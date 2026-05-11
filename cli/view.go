@@ -458,15 +458,15 @@ func (m model) buildMatrixTable() string {
 		return mutedStyle.Render("  (regional matrix unavailable — check your ElectricityMaps token)")
 	}
 
-	// Overhead: box border(2) + box padding(2) + 4 cols × cell padding(2) = 12
-	const overhead = 2 + 2 + 4*2 // = 12
+	// Overhead: box border(2) + box padding(2) + 6 cols × cell padding(2) = 16
+	const overhead = 2 + 2 + 6*2 // = 16
 	avail := m.vpWidth() - overhead
-	if avail < 45 {
-		avail = 45
+	if avail < 72 {
+		avail = 72
 	}
 
-	intW, totW, deltaW := 18, 13, 12
-	fixed := intW + totW + deltaW // 43
+	intW, totW, deltaW, hrW, moW := 16, 11, 9, 10, 11
+	fixed := intW + totW + deltaW + hrW + moW
 	regionW := avail - fixed
 	if regionW < 18 {
 		regionW = 18
@@ -474,9 +474,11 @@ func (m model) buildMatrixTable() string {
 
 	cols := []table.Column{
 		{Title: "Region", Width: regionW},
-		{Title: "Grid (gCO₂e/kWh)", Width: intW},
-		{Title: "Daily (kg)", Width: totW},
+		{Title: "Grid gCO₂/kWh", Width: intW},
+		{Title: "CO₂ kg/day", Width: totW},
 		{Title: "Ops Δ", Width: deltaW},
+		{Title: "$/hr", Width: hrW},
+		{Title: "$/mo", Width: moW},
 	}
 
 	var rows []table.Row
@@ -486,6 +488,18 @@ func (m model) buildMatrixTable() string {
 			fmt.Sprintf("%.2f", d.Intensity),
 			fmt.Sprintf("%.4f", d.Total),
 			d.DeltaStr,
+			func() string {
+				if !d.CostKnown {
+					return "—"
+				}
+				return fmt.Sprintf("%.4f", d.HourlyCost)
+			}(),
+			func() string {
+				if !d.CostKnown {
+					return "—"
+				}
+				return fmt.Sprintf("%.2f", d.MonthlyCost)
+			}(),
 		})
 	}
 
@@ -537,10 +551,10 @@ func (m model) buildCostTable() string {
 
 	overhead := 2 + 2 + 5*2
 	avail := m.vpWidth() - overhead
-	if avail < 55 {
-		avail = 55
+	if avail < 62 {
+		avail = 62
 	}
-	currW, targetW, deltaW, statusW := 11, 11, 11, 16
+	currW, targetW, deltaW, statusW := 12, 12, 10, 14
 	nameW := avail - (currW + targetW + deltaW + statusW)
 	if nameW < 22 {
 		nameW = 22
@@ -548,8 +562,8 @@ func (m model) buildCostTable() string {
 
 	cols := []table.Column{
 		{Title: "Resource", Width: nameW},
-		{Title: "Current $/hr", Width: currW},
-		{Title: "Target $/hr", Width: targetW},
+		{Title: "Base $/hr", Width: currW},
+		{Title: "Sim $/hr", Width: targetW},
 		{Title: "Δ $/hr", Width: deltaW},
 		{Title: "Status", Width: statusW},
 	}

@@ -112,6 +112,7 @@ func buildRegionalMatrix(
 			networkProfile, lambdaInvocations,
 		)
 		simTotal := simOps + simEmb
+		costSummary, _ := buildCostSummary(&plan, res.Region, lambdaInvocations)
 
 		regionName := res.Region
 		if loc, ok := awsRegionNames[res.Region]; ok {
@@ -133,13 +134,21 @@ func buildRegionalMatrix(
 		}
 
 		rows = append(rows, MatrixRow{
-			RegionName: regionName,
-			Intensity:  res.Intensity,
-			Total:      simTotal,
-			DeltaStr:   deltaStr,
+			RegionName:  regionName,
+			Intensity:   res.Intensity,
+			Total:       simTotal,
+			DeltaStr:    deltaStr,
+			HourlyCost:  costSummary.TotalHourly,
+			MonthlyCost: costSummary.TotalMonthly,
+			CostKnown:   len(costSummary.Resources) > 0 && costSummary.UnavailableCount < len(costSummary.Resources),
 		})
-		ctx.WriteString(fmt.Sprintf("- %s: %.2f gCO₂e/kWh, %.4f kg/day (Ops Δ: %s)\n",
-			regionName, res.Intensity, simTotal, deltaStr))
+		if len(costSummary.Resources) > 0 {
+			ctx.WriteString(fmt.Sprintf("- %s: %.2f gCO₂e/kWh, %.4f kg/day (Ops Δ: %s), $%.4f/hr, $%.2f/mo\n",
+				regionName, res.Intensity, simTotal, deltaStr, costSummary.TotalHourly, costSummary.TotalMonthly))
+		} else {
+			ctx.WriteString(fmt.Sprintf("- %s: %.2f gCO₂e/kWh, %.4f kg/day (Ops Δ: %s)\n",
+				regionName, res.Intensity, simTotal, deltaStr))
+		}
 	}
 
 	return rows, ctx.String()
