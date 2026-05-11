@@ -81,6 +81,26 @@ type MatrixRow struct {
 	DeltaStr   string
 }
 
+type CostResource struct {
+	Address   string
+	Type      string
+	Name      string
+	Quantity  float64
+	Unit      string
+	Hourly    float64
+	Monthly   float64
+	Available bool
+	Note      string
+}
+
+type CostSummary struct {
+	Region           string
+	Resources        []CostResource
+	TotalHourly      float64
+	TotalMonthly     float64
+	UnavailableCount int
+}
+
 // ── TUI state types ───────────────────────────────────────────────────────────
 
 type appState int
@@ -128,6 +148,8 @@ type analysisCompleteMsg struct {
 	hasLambdaRes  bool
 	matrixData    []MatrixRow
 	matrixContext string
+	baselineCost  CostSummary
+	pricingWarn   string
 }
 
 type aiCompleteMsg struct{ content string }
@@ -178,6 +200,10 @@ type model struct {
 	// Regional matrix data (raw, rendered into table at paint time)
 	matrixData    []MatrixRow
 	matrixContext string
+	baselineCost  CostSummary
+	targetCost    CostSummary
+	baselineWarn  string
+	pricingWarn   string
 
 	// AI output (glamour-rendered markdown string)
 	aiContent string

@@ -18,9 +18,12 @@ const sideW = 36
 
 // simCompleteMsg is sent when an async region-move simulation finishes.
 type simCompleteMsg struct {
-	ops   float64
-	emb   float64
-	total float64
+	ops          float64
+	emb          float64
+	total        float64
+	targetRegion string
+	targetCost   CostSummary
+	pricingWarn  string
 }
 
 // ── Initial model ─────────────────────────────────────────────────────────────
@@ -212,6 +215,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.hasLambdaRes = msg.hasLambdaRes
 		m.matrixData = msg.matrixData
 		m.matrixContext = msg.matrixContext
+		m.baselineCost = msg.baselineCost
+		m.targetCost = CostSummary{}
+		m.baselineWarn = msg.pricingWarn
+		m.pricingWarn = msg.pricingWarn
 		m.simDone = false
 		m.aiContent = ""
 		m.aiLoading = true
@@ -252,6 +259,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.simOps = msg.ops
 		m.simEmb = msg.emb
 		m.simTotal = msg.total
+		m.targetCost = msg.targetCost
+		m.pricingWarn = combineWarnings(m.baselineWarn, msg.pricingWarn)
 		m.simDone = true
 		if m.mainVPReady {
 			m.mainVP.SetContent(m.buildMainContent())
@@ -571,6 +580,9 @@ func (m model) applyOptimization() (model, tea.Cmd) {
 		m.simOps = simOps
 		m.simEmb = simEmb
 		m.simTotal = simOps + simEmb
+		targetCost, warn := buildCostSummary(&simPlan, m.region, m.lambdaInvocations)
+		m.targetCost = targetCost
+		m.pricingWarn = combineWarnings(m.baselineWarn, warn)
 		m.simDone = true
 		if m.mainVPReady {
 			m.mainVP.SetContent(m.buildMainContent())
@@ -588,6 +600,23 @@ func (m model) applyOptimization() (model, tea.Cmd) {
 		m.embodiedData, m.vcpuMap, m.x86Coeff, m.armCoeff,
 		m.networkProfile, m.lambdaInvocations,
 	)
+}
+
+func combineWarnings(base, sim string) string {
+	base = strings.TrimSpace(base)
+	sim = strings.TrimSpace(sim)
+	switch {
+	case base == "" && sim == "":
+		return ""
+	case base == "":
+		return sim
+	case sim == "":
+		return base
+	case base == sim:
+		return base
+	default:
+		return base + "\n" + sim
+	}
 }
 
 // ── Layout helpers ────────────────────────────────────────────────────────────
@@ -628,6 +657,7 @@ func runAnalysisCmd(
 		impacts, totalOps, totalEmb := calculateImpact(
 			&plan, region, intensity, embodied, vcpuMap, x86, arm, networkProfile, lambdaInv,
 		)
+		baselineCost, pricingWarn := buildCostSummary(&plan, region, lambdaInv)
 
 		var topResource ResourceImpact
 		highest := -1.0
@@ -656,6 +686,8 @@ func runAnalysisCmd(
 			hasLambdaRes:  hasLambda,
 			matrixData:    matrixData,
 			matrixContext: matrixCtx,
+			baselineCost:  baselineCost,
+			pricingWarn:   pricingWarn,
 		}
 	}
 }
@@ -683,6 +715,14 @@ func runRegionSimCmd(
 		_, simOps, simEmb := calculateImpact(
 			&plan, newRegion, intensity, embodied, vcpuMap, x86, arm, networkProfile, lambdaInv,
 		)
-		return simCompleteMsg{ops: simOps, emb: simEmb, total: simOps + simEmb}
+		targetCost, pricingWarn := buildCostSummary(&plan, newRegion, lambdaInv)
+		return simCompleteMsg{
+			ops:          simOps,
+			emb:          simEmb,
+			total:        simOps + simEmb,
+			targetRegion: newRegion,
+			targetCost:   targetCost,
+			pricingWarn:  pricingWarn,
+		}
 	}
 }

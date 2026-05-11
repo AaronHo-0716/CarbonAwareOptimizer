@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/table"
@@ -330,6 +331,24 @@ func (m model) renderSidePanel() string {
 			b.WriteString(redStyle.Render(
 				fmt.Sprintf("  ⚠  +%.4f kg  (+%.1f%%)", -savings, -pct)) + "\n")
 		}
+
+		if m.baselineCost.Region != "" && m.targetCost.Region != "" {
+			baseMonthly := m.baselineCost.TotalMonthly
+			targetMonthly := m.targetCost.TotalMonthly
+			costDelta := targetMonthly - baseMonthly
+			prefix := "+"
+			if costDelta < 0 {
+				prefix = ""
+			}
+			b.WriteString("\n")
+			b.WriteString(fmt.Sprintf("  Cost before  $%.2f/mo\n", baseMonthly))
+			b.WriteString(fmt.Sprintf("  Cost after   $%.2f/mo\n", targetMonthly))
+			if costDelta <= 0 {
+				b.WriteString(greenBoldStyle.Render(fmt.Sprintf("  💰 %s%.2f/mo", prefix, costDelta)) + "\n")
+			} else {
+				b.WriteString(redStyle.Render(fmt.Sprintf("  💰 +%.2f/mo", costDelta)) + "\n")
+			}
+		}
 	}
 
 	// ── Border + dimensions ───────────────────────────────────────────────────
@@ -350,6 +369,8 @@ func (m model) buildMainContent() string {
 		m.buildImpactTable(),
 		"",
 		m.buildMatrixTable(),
+		"",
+		m.buildCostTable(),
 		"",
 		m.buildAISection(),
 	}
@@ -500,6 +521,140 @@ func (m model) buildAISection() string {
 	}
 	heading := sectionHeadStyle.Render("🌿  AI GreenOps Recommendations")
 	return "\n" + heading + "\n" + m.aiContent
+}
+
+func (m model) buildCostTable() string {
+	if len(m.baselineCost.Resources) == 0 {
+		msg := "pricing comparison unavailable"
+		if m.pricingWarn != "" {
+			msg = m.pricingWarn
+		}
+		return focusedBorderStyle.
+			BorderForeground(clrYellow).
+			Padding(0, 1).
+			Render(sectionHeadStyle.Render("💵  Regional Cost Comparison") + "\n\n" + yellowStyle.Render(msg))
+	}
+
+	overhead := 2 + 2 + 5*2
+	avail := m.vpWidth() - overhead
+	if avail < 55 {
+		avail = 55
+	}
+	currW, targetW, deltaW, statusW := 11, 11, 11, 16
+	nameW := avail - (currW + targetW + deltaW + statusW)
+	if nameW < 22 {
+		nameW = 22
+	}
+
+	cols := []table.Column{
+		{Title: "Resource", Width: nameW},
+		{Title: "Current $/hr", Width: currW},
+		{Title: "Target $/hr", Width: targetW},
+		{Title: "Δ $/hr", Width: deltaW},
+		{Title: "Status", Width: statusW},
+	}
+
+	targetByAddress := make(map[string]CostResource)
+	for _, r := range m.targetCost.Resources {
+		targetByAddress[r.Address] = r
+	}
+
+	var rows []table.Row
+	for _, b := range m.baselineCost.Resources {
+		label := truncate(fmt.Sprintf("%s.%s", b.Type, b.Name), nameW-1)
+		target, hasTarget := targetByAddress[b.Address]
+		currStr := "—"
+		targetStr := "—"
+		deltaStr := "—"
+		status := "price unavailable"
+
+		if b.Available {
+			currStr = fmt.Sprintf("%.5f", b.Hourly)
+		}
+		if hasTarget && target.Available {
+			targetStr = fmt.Sprintf("%.5f", target.Hourly)
+		}
+		if b.Available && hasTarget && target.Available {
+			delta := target.Hourly - b.Hourly
+			if delta >= 0 {
+				deltaStr = fmt.Sprintf("+%.5f", delta)
+			} else {
+				deltaStr = fmt.Sprintf("%.5f", delta)
+			}
+			status = "estimated"
+		}
+		if !hasTarget {
+			if m.simDone {
+				status = "missing target row"
+			} else {
+				status = "baseline only"
+			}
+		}
+		rows = append(rows, table.Row{label, currStr, targetStr, deltaStr, truncate(status, statusW-1)})
+	}
+
+	if len(rows) == 0 {
+		rows = append(rows, table.Row{"(no managed resources)", "—", "—", "—", "—"})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i][0] < rows[j][0] })
+
+	rows = append(rows, table.Row{
+		"── TOTALS ──",
+		fmt.Sprintf("%.5f", m.baselineCost.TotalHourly),
+		func() string {
+			if m.targetCost.Region == "" {
+				return "—"
+			}
+			return fmt.Sprintf("%.5f", m.targetCost.TotalHourly)
+		}(),
+		func() string {
+			if m.targetCost.Region == "" {
+				return "—"
+			}
+			d := m.targetCost.TotalHourly - m.baselineCost.TotalHourly
+			if d >= 0 {
+				return fmt.Sprintf("+%.5f", d)
+			}
+			return fmt.Sprintf("%.5f", d)
+		}(),
+		"hourly",
+	})
+
+	ts := table.DefaultStyles()
+	ts.Header = ts.Header.
+		BorderStyle(lipgloss.NormalBorder()).
+		BorderForeground(clrDim).
+		BorderBottom(true).Bold(true).
+		Foreground(clrGreen)
+	ts.Selected = lipgloss.NewStyle()
+	t := table.New(
+		table.WithColumns(cols),
+		table.WithRows(rows),
+		table.WithHeight(len(rows)+2),
+	)
+	t.SetStyles(ts)
+
+	var summary strings.Builder
+	summary.WriteString(fmt.Sprintf("Current (%s): $%.4f/hr  |  $%.2f/mo", m.baselineCost.Region, m.baselineCost.TotalHourly, m.baselineCost.TotalMonthly))
+	if m.targetCost.Region != "" {
+		dm := m.targetCost.TotalMonthly - m.baselineCost.TotalMonthly
+		sign := "+"
+		if dm < 0 {
+			sign = ""
+		}
+		summary.WriteString(fmt.Sprintf("\nTarget (%s):  $%.4f/hr  |  $%.2f/mo  (%s%.2f/mo)", m.targetCost.Region, m.targetCost.TotalHourly, m.targetCost.TotalMonthly, sign, dm))
+	}
+	if m.baselineCost.UnavailableCount > 0 || m.targetCost.UnavailableCount > 0 {
+		summary.WriteString(fmt.Sprintf("\nUnavailable prices: current %d, target %d", m.baselineCost.UnavailableCount, m.targetCost.UnavailableCount))
+	}
+	if m.pricingWarn != "" {
+		summary.WriteString("\n" + yellowStyle.Render(m.pricingWarn))
+	}
+
+	return focusedBorderStyle.
+		BorderForeground(clrBlue).
+		Padding(0, 1).
+		Render(sectionHeadStyle.Render("💵  Regional Cost Comparison") + "\n\n" + t.View() + "\n\n" + summary.String())
 }
 
 // ── Utility ───────────────────────────────────────────────────────────────────
