@@ -230,6 +230,30 @@ func (m model) viewResults() string {
 // ── Side panel ────────────────────────────────────────────────────────────────
 
 func (m model) renderSidePanel() string {
+	body := m.renderSidePanelBody()
+	isFocused := m.focus == focusSide
+
+	borderStyle := unfocusedBorderStyle
+	if isFocused {
+		borderStyle = focusedBorderStyle
+	}
+
+	vp := m.sideVP
+	vp.Width = sideW - 2
+	vp.Height = m.vpHeight()
+	vp.SetContent(body)
+	vp.SetYOffset(sideVPOffsetForFocus(body, m.sideVP.YOffset, vp.Height))
+
+	return borderStyle.
+		Width(sideW - 2).
+		Height(m.vpHeight()).
+		Render(vp.View())
+}
+
+// renderSidePanelBody is the pure string-builder for the side panel content,
+// excluding the surrounding border + viewport. Kept separate so Update can
+// compute scroll offsets without round-tripping through render.
+func (m model) renderSidePanelBody() string {
 	active := m.activeSideItems()
 	isFocused := m.focus == focusSide
 
@@ -329,6 +353,11 @@ func (m model) renderSidePanel() string {
 
 	b.WriteString("\n")
 	b.WriteString(cursor(sideApply) + btn("     Apply      ", sideApply) + "\n")
+	b.WriteString("\n")
+	b.WriteString(cursor(sideExportPDF) + btn(" Export PDF (^P) ", sideExportPDF) + "\n")
+	if m.lastExportMsg != "" {
+		b.WriteString(mutedStyle.Render(m.lastExportMsg) + "\n")
+	}
 
 	// ── Simulation result ─────────────────────────────────────────────────────
 	if m.simDone {
@@ -371,50 +400,39 @@ func (m model) renderSidePanel() string {
 		}
 	}
 
-	// ── Border + dimensions ───────────────────────────────────────────────────
-	borderStyle := unfocusedBorderStyle
-	if isFocused {
-		borderStyle = focusedBorderStyle
-	}
-
-	// Clip body to the panel height with auto-scroll so the focused item stays
-	// visible. Without this, the Projected Savings block can push the layout
-	// past the screen bottom.
-	body := clipSidePanel(b.String(), m.vpHeight(), isFocused)
-
-	return borderStyle.
-		Width(sideW - 2). // -2 for the two border chars
-		Height(m.vpHeight()).
-		Render(body)
+	return b.String()
 }
 
-// clipSidePanel windows `body` to at most `h` lines, scrolling so the focused
-// cursor marker ("▶ ") is in view. When isFocused is false, the top of the
-// panel is shown. When the content already fits, body is returned as-is.
-func clipSidePanel(body string, h int, isFocused bool) string {
+// sideVPOffsetForFocus returns a YOffset that keeps the focus marker visible
+// within a window of `h` lines. If the focus marker isn't present (i.e. the
+// side panel isn't focused), it preserves the existing offset.
+func sideVPOffsetForFocus(body string, currentOffset, h int) int {
 	if h < 1 {
-		h = 1
+		return 0
 	}
-	lines := strings.Split(body, "\n")
-	if len(lines) <= h {
-		return body
-	}
-	focusLine := 0
-	if isFocused {
-		marker := greenBoldStyle.Render("▶ ")
-		if idx := strings.Index(body, marker); idx >= 0 {
-			focusLine = strings.Count(body[:idx], "\n")
+	marker := greenBoldStyle.Render("▶ ")
+	idx := strings.Index(body, marker)
+	if idx < 0 {
+		// No focus; clamp existing offset to content range.
+		lines := strings.Count(body, "\n") + 1
+		if currentOffset+h > lines {
+			currentOffset = lines - h
 		}
+		if currentOffset < 0 {
+			currentOffset = 0
+		}
+		return currentOffset
 	}
-	start := focusLine - h/3
-	if start+h > len(lines) {
-		start = len(lines) - h
+	focusLine := strings.Count(body[:idx], "\n")
+	if focusLine < currentOffset {
+		return focusLine
 	}
-	if start < 0 {
-		start = 0
+	if focusLine >= currentOffset+h {
+		return focusLine - h + 1
 	}
-	return strings.Join(lines[start:start+h], "\n")
+	return currentOffset
 }
+
 
 // ── Main viewport content ─────────────────────────────────────────────────────
 

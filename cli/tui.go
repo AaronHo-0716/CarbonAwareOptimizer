@@ -182,6 +182,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.mainVP.Height = m.vpHeight()
 			m.mainVP.SetContent(m.buildMainContent())
 		}
+		if m.sideVPReady {
+			m.sideVP.Width = sideW - 2
+			m.sideVP.Height = m.vpHeight()
+			m.syncSideVPOffset()
+		}
 		return m, nil
 
 	// ── Keys ─────────────────────────────────────────────────────────────────
@@ -279,6 +284,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.mainVP = vp
 		m.mainVPReady = true
 
+		// Side panel viewport (scrollable).
+		svp := viewport.New(sideW-2, m.vpHeight())
+		m.sideVP = svp
+		m.sideVPReady = true
+		m.syncSideVPOffset()
+
 		if msg.skipAIFetch {
 			m.aiLoading = false
 			return m, nil
@@ -288,10 +299,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// ── AI result ────────────────────────────────────────────────────────────
 	case aiCompleteMsg:
 		m.aiContent = msg.content
+		m.aiContentRaw = msg.raw
 		m.aiLoading = false
 		if m.mainVPReady {
 			m.mainVP.SetContent(m.buildMainContent())
 		}
+		return m, nil
+
+	// ── PDF export result ────────────────────────────────────────────────────
+	case pdfExportMsg:
+		if msg.err != nil {
+			m.lastExportMsg = "❌ " + msg.err.Error()
+		} else {
+			m.lastExportMsg = "✅ Saved " + msg.path
+		}
+		m.syncSideVPOffset()
 		return m, nil
 
 	// ── Region-simulation result ──────────────────────────────────────────────
@@ -308,6 +330,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.mainVPReady {
 			m.mainVP.SetContent(m.buildMainContent())
 		}
+		m.syncSideVPOffset()
 		return m, nil
 
 	// ── Error ────────────────────────────────────────────────────────────────
@@ -395,6 +418,10 @@ func (m model) updateResults(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.simRegion = ""
 		m.errMsg = ""
 		return m, nil
+
+	case "ctrl+p":
+		m.lastExportMsg = "⏳ Exporting PDF…"
+		return m, m.exportPDFCmd()
 	}
 
 	if m.focus == focusSide {
@@ -448,6 +475,16 @@ func (m model) updateSidePanel(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
+	// Manual scrolling of the side panel viewport (doesn't change focus).
+	switch msg.String() {
+	case "pgup", "ctrl+u":
+		m.sideVP.LineUp(m.sideVP.Height / 2)
+		return m, nil
+	case "pgdown", "ctrl+d":
+		m.sideVP.LineDown(m.sideVP.Height / 2)
+		return m, nil
+	}
+
 	// General navigation
 	switch msg.String() {
 	case "up", "k":
@@ -483,6 +520,9 @@ func (m model) updateSidePanel(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m.triggerReanalysis()
 		case sideApply:
 			return m.applyOptimization()
+		case sideExportPDF:
+			m.lastExportMsg = "⏳ Exporting PDF…"
+			return m, m.exportPDFCmd()
 		}
 
 	case "esc":
@@ -533,7 +573,7 @@ func (m model) activeSideItems() []sideItem {
 	if m.optType == "region" {
 		items = append(items, sideRegionInput)
 	}
-	items = append(items, sideApply)
+	items = append(items, sideApply, sideExportPDF)
 	return items
 }
 
@@ -571,6 +611,17 @@ func (m model) prevSideItem() sideItem {
 	return m.sideFocused
 }
 
+// syncSideVPOffset recomputes the side viewport scroll offset so the focused
+// item stays visible. Call this whenever the focused side item changes or the
+// panel content's height changes (e.g. after simulation completes).
+func (m *model) syncSideVPOffset() {
+	if m.sideVP.Height <= 0 {
+		return
+	}
+	body := m.renderSidePanelBody()
+	m.sideVP.SetYOffset(sideVPOffsetForFocus(body, m.sideVP.YOffset, m.sideVP.Height))
+}
+
 // syncInputFocus blurs all text inputs then focuses the one matching sideFocused.
 // Returns an updated model copy and the optional blink command from Focus().
 func (m model) syncInputFocus() (model, tea.Cmd) {
@@ -580,6 +631,7 @@ func (m model) syncInputFocus() (model, tea.Cmd) {
 	m.workUtilInput.Blur()
 	m.idleUtilInput.Blur()
 	m.regionInput.Blur()
+	m.syncSideVPOffset()
 	if m.focus == focusSide {
 		switch m.sideFocused {
 		case sideLambdaInput:
@@ -931,7 +983,7 @@ func fetchAICmd(orToken string, top ResourceImpact, region string, intensity flo
 		if err != nil {
 			rendered = raw
 		}
-		return aiCompleteMsg{content: rendered}
+		return aiCompleteMsg{content: rendered, raw: raw}
 	}
 }
 

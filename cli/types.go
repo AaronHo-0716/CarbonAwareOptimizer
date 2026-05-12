@@ -164,6 +164,7 @@ const (
 	sideOptRegion
 	sideRegionInput
 	sideApply
+	sideExportPDF
 )
 
 // ── Bubble Tea messages ───────────────────────────────────────────────────────
@@ -189,7 +190,10 @@ type analysisCompleteMsg struct {
 	pricingWarn   string
 }
 
-type aiCompleteMsg struct{ content string }
+type aiCompleteMsg struct {
+	content string // glamour-rendered (ANSI) string for the TUI
+	raw     string // original markdown source (kept for PDF export)
+}
 
 // ── TUI model ─────────────────────────────────────────────────────────────────
 
@@ -245,13 +249,21 @@ type model struct {
 	baselineWarn  string
 	pricingWarn   string
 
-	// AI output (glamour-rendered markdown string)
-	aiContent string
-	aiLoading bool
+	// AI output (glamour-rendered markdown string + raw markdown source)
+	aiContent    string
+	aiContentRaw string
+	aiLoading    bool
+
+	// Transient status line shown in side panel after PDF export.
+	lastExportMsg string
 
 	// Main scrollable viewport (left panel)
 	mainVP      viewport.Model
 	mainVPReady bool
+
+	// Side-panel scrollable viewport (right panel)
+	sideVP      viewport.Model
+	sideVPReady bool
 
 	// Panel focus
 	focus panelFocus
