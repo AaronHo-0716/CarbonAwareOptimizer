@@ -84,10 +84,20 @@ func initialModel() model {
 	wd, _ := os.Getwd()
 	fp := newFilePicker(wd)
 
-	initState := stateFilePicker
+	initState := stateS3Probing
 	if emToken == "" {
 		initState = stateAPIKeys
 	}
+
+	// S3 prompt inputs.
+	slugIn := textinput.New()
+	slugIn.Placeholder = "e.g. user-prod-2026q2"
+	slugIn.CharLimit = 63
+	slugIn.Width = 50
+
+	bucketIn := textinput.New()
+	bucketIn.CharLimit = 63
+	bucketIn.Width = 50
 
 	// Pre-load CSV data (fast, local disk read)
 	embodied := parseEmbodiedEmissions()
@@ -129,6 +139,9 @@ func initialModel() model {
 		sideFocused:       sideOptGraviton,
 		intensityCache:    make(map[string][]CarbonIntensityPoint),
 
+		s3SlugInput:   slugIn,
+		s3CreateInput: bucketIn,
+
 		focus: focusMain,
 	}
 }
@@ -164,7 +177,12 @@ func saveEnv(emToken, orToken string) {
 
 func (m model) Init() tea.Cmd {
 	// customFilePicker loads synchronously; only text-input blink needed.
-	return textinput.Blink
+	// If we're starting in the probe state, also kick off S3 detection.
+	cmds := []tea.Cmd{textinput.Blink}
+	if m.state == stateS3Probing {
+		cmds = append(cmds, m.spinner.Tick, s3ProbeCmd())
+	}
+	return tea.Batch(cmds...)
 }
 
 // ── Update ────────────────────────────────────────────────────────────────────
@@ -197,6 +215,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch m.state {
 		case stateAPIKeys:
 			return m.updateAPIKeys(msg)
+		case stateS3Probing:
+			return m, nil // absorb input while the probe is in flight
+		case stateS3Source:
+			return m.updateS3Source(msg)
+		case stateS3CreateBucket:
+			return m.updateS3CreateBucket(msg)
+		case stateS3SlugInput:
+			return m.updateS3Slug(msg)
 		case stateFilePicker:
 			switch msg.String() {
 			case "q":
@@ -230,7 +256,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	// ── Spinner ───────────────────────────────────────────────────────────────
 	case spinner.TickMsg:
-		if m.state == stateLoading {
+		if m.state == stateLoading || m.state == stateS3Probing {
 			var cmd tea.Cmd
 			m.spinner, cmd = m.spinner.Update(msg)
 			return m, cmd
@@ -242,6 +268,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.plan = msg.plan
 		cp := msg.plan
 		m.cachedPlan = &cp
+		if msg.rawPlanBytes != nil {
+			m.rawPlanBytes = msg.rawPlanBytes
+		}
+		m.loadedFromS3 = false
 		m.region = msg.region
 		m.gridIntensity = msg.intensity
 		m.intensityData = msg.intensityData
@@ -316,6 +346,89 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.syncSideVPOffset()
 		return m, nil
 
+	// ── S3 probe result ───────────────────────────────────────────────────────
+	case s3ProbeMsg:
+		m.s3 = msg.client
+		if msg.err != nil {
+			// Probe failed (no creds, no network, permission denied). Fall
+			// through to the local file picker so the user can still analyse.
+			m.s3Error = msg.err.Error()
+			m.state = stateFilePicker
+			return m, nil
+		}
+		m.s3Bucket = msg.bucket
+		if msg.bucket == "" {
+			m.state = stateFilePicker
+			return m, nil
+		}
+		// Bucket exists — fetch the run log and show the source screen.
+		return m, s3ListCmd(m.s3, m.s3Bucket)
+
+	// ── S3 list result ────────────────────────────────────────────────────────
+	case s3ListMsg:
+		if msg.err != nil {
+			m.s3Error = msg.err.Error()
+		}
+		m.s3Plans = msg.plans
+		m.s3Cursor = 0
+		m.state = stateS3Source
+		return m, nil
+
+	// ── S3 load result (decant a stored bundle into the model) ───────────────
+	case s3LoadCompleteMsg:
+		if msg.err != nil {
+			m.errMsg = "S3 load failed: " + msg.err.Error()
+			m.state = stateS3Source
+			return m, nil
+		}
+		applyS3Bundle(&m, msg.bundle)
+		m.state = stateResults
+		active := m.activeSideItems()
+		if len(active) > 0 {
+			m.sideFocused = active[0]
+		} else {
+			m.sideFocused = sideOptGraviton
+		}
+		vp := viewport.New(m.vpWidth(), m.vpHeight())
+		vp.SetContent(m.buildMainContent())
+		m.mainVP = vp
+		m.mainVPReady = true
+		svp := viewport.New(sideW-2, m.vpHeight())
+		m.sideVP = svp
+		m.sideVPReady = true
+		m.syncSideVPOffset()
+		m.lastUploadMsg = "✅ Loaded " + msg.planID + " from S3"
+		return m, nil
+
+	// ── S3 upload result ──────────────────────────────────────────────────────
+	case s3UploadMsg:
+		if msg.err != nil {
+			m.lastUploadMsg = "❌ " + msg.err.Error()
+		} else {
+			m.lastUploadMsg = "✅ Uploaded " + msg.planID + " to s3://" + m.s3Bucket
+		}
+		m.syncSideVPOffset()
+		if m.mainVPReady {
+			m.mainVP.SetContent(m.buildMainContent())
+		}
+		return m, nil
+
+	// ── S3 create-bucket result ──────────────────────────────────────────────
+	case s3CreateBucketMsg:
+		if msg.err != nil {
+			m.lastUploadMsg = "❌ " + msg.err.Error()
+			return m, nil
+		}
+		m.s3Bucket = msg.name
+		// Continue the queued upload now that the bucket exists.
+		slug := strings.TrimSpace(strings.ToLower(m.s3SlugInput.Value()))
+		if slug == "" {
+			m.lastUploadMsg = "✅ Created bucket " + msg.name
+			return m, nil
+		}
+		m.lastUploadMsg = "⏳ Uploading to " + msg.name + "…"
+		return m, s3UploadCmd(m, slug)
+
 	// ── Region-simulation result ──────────────────────────────────────────────
 	case simCompleteMsg:
 		m.simOps = msg.ops
@@ -377,9 +490,9 @@ func (m model) updateAPIKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.emToken = em
 		m.orToken = strings.TrimSpace(m.orInput.Value())
 		saveEnv(m.emToken, m.orToken)
-		m.state = stateFilePicker
+		m.state = stateS3Probing
 		m.keyError = ""
-		return m, nil
+		return m, tea.Batch(m.spinner.Tick, s3ProbeCmd())
 	}
 
 	// Forward keystrokes to the focused text input
@@ -416,12 +529,25 @@ func (m model) updateResults(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.simImpacts = nil
 		m.simOpsSeries = nil
 		m.simRegion = ""
+		m.rawPlanBytes = nil
+		m.loadedFromS3 = false
 		m.errMsg = ""
 		return m, nil
 
 	case "ctrl+p":
 		m.lastExportMsg = "⏳ Exporting PDF…"
 		return m, m.exportPDFCmd()
+
+	case "ctrl+s":
+		if m.s3 == nil {
+			m.lastUploadMsg = "❌ AWS not available (check credentials)"
+			return m, nil
+		}
+		m.s3SlugInput.SetValue("")
+		m.s3SlugInput.Focus()
+		m.s3Error = ""
+		m.state = stateS3SlugInput
+		return m, nil
 	}
 
 	if m.focus == focusSide {
@@ -837,14 +963,16 @@ func runAnalysisCmd(
 ) tea.Cmd {
 	return func() tea.Msg {
 		var plan TFPlan
+		var rawPlan []byte
 		if cachedPlan != nil {
 			plan = *cachedPlan
 		} else {
-			loaded, err := loadPlan(path)
+			loaded, raw, err := loadPlan(path)
 			if err != nil {
 				return errMsg{err}
 			}
 			plan = loaded
+			rawPlan = raw
 		}
 		region := extractRegion(plan)
 		intensityData := intensityCache[region]
@@ -879,6 +1007,7 @@ func runAnalysisCmd(
 
 		return analysisCompleteMsg{
 			plan:          plan,
+			rawPlanBytes:  rawPlan,
 			region:        region,
 			intensity:     intensity,
 			intensityData: intensityData,

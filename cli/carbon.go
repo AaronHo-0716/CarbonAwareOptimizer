@@ -76,10 +76,10 @@ func getRegionGroup(region string) []string {
 
 // ── Plan loading ──────────────────────────────────────────────────────────────
 
-func loadPlan(path string) (TFPlan, error) {
+func loadPlan(path string) (TFPlan, []byte, error) {
 	info, err := os.Stat(path)
 	if err != nil {
-		return TFPlan{}, fmt.Errorf("cannot access path: %w", err)
+		return TFPlan{}, nil, fmt.Errorf("cannot access path: %w", err)
 	}
 
 	var planData []byte
@@ -88,7 +88,7 @@ func loadPlan(path string) (TFPlan, error) {
 		// Pre-computed JSON plan — read directly.
 		planData, err = os.ReadFile(path)
 		if err != nil {
-			return TFPlan{}, fmt.Errorf("reading plan file: %w", err)
+			return TFPlan{}, nil, fmt.Errorf("reading plan file: %w", err)
 		}
 	} else {
 		// Directory or .tf file — run terraform init / plan / show.
@@ -97,7 +97,7 @@ func loadPlan(path string) (TFPlan, error) {
 			dir = filepath.Dir(path) // .tf file: use its directory
 		}
 		if _, err := exec.LookPath("terraform"); err != nil {
-			return TFPlan{}, fmt.Errorf("terraform CLI not found — provide a plan.json instead")
+			return TFPlan{}, nil, fmt.Errorf("terraform CLI not found — provide a plan.json instead")
 		}
 
 		// Build the environment: inherit current env, ensure AWS_PROFILE is set.
@@ -110,7 +110,7 @@ func loadPlan(path string) (TFPlan, error) {
 		initCmd.Dir = dir
 		initCmd.Env = tfEnv
 		if out, err := initCmd.CombinedOutput(); err != nil {
-			return TFPlan{}, fmt.Errorf("terraform init failed:\n%s", string(out))
+			return TFPlan{}, nil, fmt.Errorf("terraform init failed:\n%s", string(out))
 		}
 
 		planFile := ".carbon_plan.tfplan"
@@ -118,7 +118,7 @@ func loadPlan(path string) (TFPlan, error) {
 		planCmd.Dir = dir
 		planCmd.Env = tfEnv
 		if out, err := planCmd.CombinedOutput(); err != nil {
-			return TFPlan{}, fmt.Errorf("terraform plan failed:\n%s", string(out))
+			return TFPlan{}, nil, fmt.Errorf("terraform plan failed:\n%s", string(out))
 		}
 		defer os.Remove(filepath.Join(dir, planFile))
 
@@ -127,15 +127,15 @@ func loadPlan(path string) (TFPlan, error) {
 		showCmd.Env = tfEnv
 		planData, err = showCmd.Output()
 		if err != nil {
-			return TFPlan{}, fmt.Errorf("terraform show failed: %w", err)
+			return TFPlan{}, nil, fmt.Errorf("terraform show failed: %w", err)
 		}
 	}
 
 	var plan TFPlan
 	if err := json.Unmarshal(planData, &plan); err != nil {
-		return TFPlan{}, fmt.Errorf("parsing plan JSON: %w", err)
+		return TFPlan{}, nil, fmt.Errorf("parsing plan JSON: %w", err)
 	}
-	return plan, nil
+	return plan, planData, nil
 }
 
 func extractRegion(plan TFPlan) string {

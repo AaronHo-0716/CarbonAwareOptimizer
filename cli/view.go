@@ -77,6 +77,14 @@ func (m model) View() string {
 	switch m.state {
 	case stateAPIKeys:
 		return m.viewAPIKeys()
+	case stateS3Probing:
+		return m.viewS3Probing()
+	case stateS3Source:
+		return m.viewS3Source()
+	case stateS3CreateBucket:
+		return m.viewS3CreateBucket()
+	case stateS3SlugInput:
+		return m.viewS3Slug()
 	case stateFilePicker:
 		return m.viewFilePicker()
 	case stateLoading:
@@ -85,6 +93,19 @@ func (m model) View() string {
 		return m.viewResults()
 	}
 	return ""
+}
+
+// viewS3Probing is shown for the brief moment the AWS tag lookup is in flight.
+func (m model) viewS3Probing() string {
+	body := strings.Join([]string{
+		greenBoldStyle.Render("🌍  Carbon Optimizer"),
+		"",
+		m.spinner.View() + " Looking for a Carbon-Optimizer S3 bucket…",
+		"",
+		dimStyle.Render("(uses your default AWS credentials)"),
+	}, "\n")
+	popup := popupStyle.Width(60).Render(body)
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, popup)
 }
 
 // ── API-keys popup (centred overlay) ─────────────────────────────────────────
@@ -357,6 +378,11 @@ func (m model) renderSidePanelBody() string {
 	b.WriteString(cursor(sideExportPDF) + btn(" Export PDF (^P) ", sideExportPDF) + "\n")
 	if m.lastExportMsg != "" {
 		b.WriteString(mutedStyle.Render(m.lastExportMsg) + "\n")
+	}
+	b.WriteString("\n")
+	b.WriteString("  " + mutedStyle.Render("Ctrl+S · Save to S3") + "\n")
+	if m.lastUploadMsg != "" {
+		b.WriteString(mutedStyle.Render(m.lastUploadMsg) + "\n")
 	}
 
 	// ── Simulation result ─────────────────────────────────────────────────────

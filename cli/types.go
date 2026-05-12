@@ -136,10 +136,14 @@ type CostSummary struct {
 type appState int
 
 const (
-	stateAPIKeys    appState = iota
-	stateFilePicker          // file-picker to choose plan
-	stateLoading             // running analysis
-	stateResults             // showing results + side panel
+	stateAPIKeys        appState = iota
+	stateS3Probing               // looking for a tagged Carbon-Optimizer bucket
+	stateS3Source                // listing prior plans (when a bucket is found)
+	stateS3CreateBucket          // confirming bucket name on first upload
+	stateS3SlugInput             // entering plan-id slug before upload
+	stateFilePicker              // file-picker to choose plan
+	stateLoading                 // running analysis
+	stateResults                 // showing results + side panel
 )
 
 type panelFocus int
@@ -173,6 +177,7 @@ type errMsg struct{ err error }
 
 type analysisCompleteMsg struct {
 	plan          TFPlan
+	rawPlanBytes  []byte
 	region        string
 	intensity     float64
 	intensityData []CarbonIntensityPoint
@@ -193,6 +198,35 @@ type analysisCompleteMsg struct {
 type aiCompleteMsg struct {
 	content string // glamour-rendered (ANSI) string for the TUI
 	raw     string // original markdown source (kept for PDF export)
+}
+
+// ── S3 messages ───────────────────────────────────────────────────────────────
+
+type s3ProbeMsg struct {
+	client *s3Client
+	bucket string
+	err    error
+}
+
+type s3ListMsg struct {
+	plans []PlanSummary
+	err   error
+}
+
+type s3LoadCompleteMsg struct {
+	planID string
+	bundle reportBundle
+	err    error
+}
+
+type s3UploadMsg struct {
+	planID string
+	err    error
+}
+
+type s3CreateBucketMsg struct {
+	name string
+	err  error
 }
 
 // ── TUI model ─────────────────────────────────────────────────────────────────
@@ -256,6 +290,19 @@ type model struct {
 
 	// Transient status line shown in side panel after PDF export.
 	lastExportMsg string
+
+	// S3 export / reload state.
+	s3            *s3Client
+	s3Bucket      string
+	s3Plans       []PlanSummary
+	s3Cursor      int
+	s3SlugInput   textinput.Model
+	s3CreateInput textinput.Model
+	s3Error       string
+	s3Busy        bool
+	rawPlanBytes  []byte // raw plan JSON, kept around so it can be redacted at upload time
+	lastUploadMsg string
+	loadedFromS3  bool
 
 	// Main scrollable viewport (left panel)
 	mainVP      viewport.Model

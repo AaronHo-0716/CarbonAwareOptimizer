@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -55,6 +56,16 @@ const (
 )
 
 func buildReportPDF(m model, outPath string) error {
+	data, err := buildReportPDFBytes(m)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(outPath, data, 0644)
+}
+
+// buildReportPDFBytes renders the same report as buildReportPDF but returns
+// the bytes instead of writing them to disk. Used by the S3 uploader.
+func buildReportPDFBytes(m model) ([]byte, error) {
 	pdf := gofpdf.New("P", "mm", "A4", "")
 	pdf.SetMargins(pdfMarginL, pdfMarginT, pdfMarginR)
 	pdf.SetAutoPageBreak(true, 14)
@@ -72,7 +83,11 @@ func buildReportPDF(m model, outPath string) error {
 	pdfCostTables(pdf, m)
 	pdfAISection(pdf, m)
 
-	return pdf.OutputFileAndClose(outPath)
+	var buf bytes.Buffer
+	if err := pdf.Output(&buf); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 // ── Section: header ───────────────────────────────────────────────────────────
