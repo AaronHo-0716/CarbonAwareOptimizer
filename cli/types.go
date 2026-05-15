@@ -141,6 +141,7 @@ const (
 	stateS3Source                // listing prior plans (when a bucket is found)
 	stateS3CreateBucket          // confirming bucket name on first upload
 	stateS3SlugInput             // entering plan-id slug before upload
+	stateS3DeleteConfirm         // confirming deletion of a prior run
 	stateFilePicker              // file-picker to choose plan
 	stateLoading                 // running analysis
 	stateResults                 // showing results + side panel
@@ -229,6 +230,11 @@ type s3CreateBucketMsg struct {
 	err  error
 }
 
+type s3DeleteMsg struct {
+	planID string
+	err    error
+}
+
 // ── TUI model ─────────────────────────────────────────────────────────────────
 
 type model struct {
@@ -298,8 +304,9 @@ type model struct {
 	s3Cursor      int
 	s3SlugInput   textinput.Model
 	s3CreateInput textinput.Model
-	s3Error       string
-	s3Busy        bool
+	s3Error        string
+	s3Busy         bool
+	s3DeleteTarget string // planID pending deletion confirmation
 	rawPlanBytes  []byte // raw plan JSON, kept around so it can be redacted at upload time
 	lastUploadMsg string
 	loadedFromS3  bool

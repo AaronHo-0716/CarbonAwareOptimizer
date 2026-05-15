@@ -85,6 +85,8 @@ func (m model) View() string {
 		return m.viewS3CreateBucket()
 	case stateS3SlugInput:
 		return m.viewS3Slug()
+	case stateS3DeleteConfirm:
+		return m.viewS3DeleteConfirm()
 	case stateFilePicker:
 		return m.viewFilePicker()
 	case stateLoading:

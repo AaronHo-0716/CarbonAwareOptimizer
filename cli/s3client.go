@@ -352,6 +352,100 @@ func (c *s3Client) appendRunLog(ctx context.Context, bucket string, entry RunLog
 	return err
 }
 
+// deletePlan removes everything for one prior run from the bucket. The run-log
+// rewrite happens last so that a mid-flight failure leaves the run still
+// listed (recoverable by re-deleting) rather than orphaning artifacts silently.
+func (c *s3Client) deletePlan(ctx context.Context, bucket, planID string) error {
+	// 1. Delete reports/<planID>/* in batches of up to 1000.
+	prefix := fmt.Sprintf("reports/%s/", planID)
+	var token *string
+	for {
+		out, err := c.s3.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(bucket),
+			Prefix:            aws.String(prefix),
+			ContinuationToken: token,
+		})
+		if err != nil {
+			return fmt.Errorf("list reports: %w", err)
+		}
+		if len(out.Contents) > 0 {
+			ids := make([]s3types.ObjectIdentifier, 0, len(out.Contents))
+			for _, obj := range out.Contents {
+				if obj.Key == nil {
+					continue
+				}
+				ids = append(ids, s3types.ObjectIdentifier{Key: obj.Key})
+			}
+			if len(ids) > 0 {
+				if _, err := c.s3.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+					Bucket: aws.String(bucket),
+					Delete: &s3types.Delete{Objects: ids, Quiet: aws.Bool(true)},
+				}); err != nil {
+					return fmt.Errorf("delete reports: %w", err)
+				}
+			}
+		}
+		if out.IsTruncated == nil || !*out.IsTruncated {
+			break
+		}
+		token = out.NextContinuationToken
+	}
+
+	// 2. Delete plans/<planID>.json (missing is fine).
+	if _, err := c.s3.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(fmt.Sprintf("plans/%s.json", planID)),
+	}); err != nil && !isNoSuchKey(err) {
+		return fmt.Errorf("delete plan json: %w", err)
+	}
+
+	// 3. Rewrite _meta/runs.ndjson dropping entries with this planID.
+	const logKey = "_meta/runs.ndjson"
+	body, err := c.getObject(ctx, bucket, logKey)
+	if err != nil {
+		if isNoSuchKey(err) {
+			return nil
+		}
+		return fmt.Errorf("read run log: %w", err)
+	}
+	scanner := bufio.NewScanner(bytes.NewReader(body))
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	var buf bytes.Buffer
+	kept := 0
+	for scanner.Scan() {
+		raw := scanner.Bytes()
+		line := bytes.TrimSpace(raw)
+		if len(line) == 0 {
+			continue
+		}
+		var e RunLogEntry
+		if err := json.Unmarshal(line, &e); err == nil && e.PlanID == planID {
+			continue
+		}
+		buf.Write(line)
+		buf.WriteByte('\n')
+		kept++
+	}
+	if kept == 0 {
+		if _, err := c.s3.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String(logKey),
+		}); err != nil && !isNoSuchKey(err) {
+			return fmt.Errorf("delete run log: %w", err)
+		}
+		return nil
+	}
+	if _, err := c.s3.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      aws.String(bucket),
+		Key:         aws.String(logKey),
+		Body:        bytes.NewReader(buf.Bytes()),
+		ContentType: aws.String("application/x-ndjson"),
+	}); err != nil {
+		return fmt.Errorf("rewrite run log: %w", err)
+	}
+	return nil
+}
+
 func (c *s3Client) getObject(ctx context.Context, bucket, key string) ([]byte, error) {
 	out, err := c.s3.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(bucket),

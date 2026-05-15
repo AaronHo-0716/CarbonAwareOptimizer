@@ -223,6 +223,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateS3CreateBucket(msg)
 		case stateS3SlugInput:
 			return m.updateS3Slug(msg)
+		case stateS3DeleteConfirm:
+			return m.updateS3DeleteConfirm(msg)
 		case stateFilePicker:
 			switch msg.String() {
 			case "q":
@@ -399,6 +401,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.syncSideVPOffset()
 		m.lastUploadMsg = "✅ Loaded " + msg.planID + " from S3"
 		return m, nil
+
+	// ── S3 delete result ──────────────────────────────────────────────────────
+	case s3DeleteMsg:
+		m.s3Busy = false
+		if msg.err != nil {
+			m.s3Error = "delete failed: " + msg.err.Error()
+			return m, nil
+		}
+		m.s3Error = ""
+		return m, s3ListCmd(m.s3, m.s3Bucket)
 
 	// ── S3 upload result ──────────────────────────────────────────────────────
 	case s3UploadMsg:
