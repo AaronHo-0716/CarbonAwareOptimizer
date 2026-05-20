@@ -346,17 +346,17 @@ func getAISuggestions(
 	}
 
 	regionPrompt := fmt.Sprintf(
-		"2. A greener region — use this live trade-off data to pick the best alternative:\n%s",
+		"2. Greener region — pick one from this data and give the reason in <=15 words:\n%s",
 		matrixContext,
 	)
 	prompt := fmt.Sprintf(
-		"You are a GreenOps Specialist. This %s in %s (Grid: %.2f gCO₂e/kWh) "+
-			"produces %.4f kg CO₂/day (Operational: %.4f kg, Embodied: %.4f kg, "+
-			"4-year hardware lifespan). Provide concise recommendations:\n"+
-			"1. A Graviton equivalent — include migration caveats "+
-			"(compiled vs interpreted, arm64 library support, RDS Graviton support).\n"+
+		"You are a GreenOps Specialist. %s in %s (grid %.2f gCO₂e/kWh) emits "+
+			"%.4f kg CO₂/day (ops %.4f, embodied %.4f, 4yr lifespan).\n\n"+
+			"Reply with exactly 3 numbered points, <=2 short sentences each. "+
+			"No preamble, no closing remarks, no disclaimers.\n"+
+			"1. Graviton equivalent + the single most important migration caveat.\n"+
 			"%s\n"+
-			"3. Scheduling or rightsizing logic with estimated savings.",
+			"3. Scheduling or rightsizing action with a %% savings estimate.",
 		top.Instance, region, gridIntensity,
 		top.TotalDaily, top.DailyOps, top.DailyEmb,
 		regionPrompt,
