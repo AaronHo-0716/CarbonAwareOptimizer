@@ -1,3 +1,4 @@
 .env
 *.json
 /docs
+unit-test-implementation-plan.md
